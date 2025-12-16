@@ -58,23 +58,23 @@ def load_table(csv_filename: str, table_name: str, parse_dates=None, chunksize: 
 
 
 def main():
-    # 1. customers
+    # 1. customers 전체 적재
     load_table(
         csv_filename="olist_customers_dataset.csv",
         table_name="customers",
         parse_dates=None
     )
 
-    # 2. products
+    # 2. products 전체 적재 (오타 컬럼 rename은 load_table 안에서 처리하는 걸로)
     load_table(
         csv_filename="olist_products_dataset.csv",
         table_name="products",
         parse_dates=None
     )
 
-    # 3. orders
+    # 3. orders - 과거 70%만 적재
     load_table(
-        csv_filename="olist_orders_dataset.csv",
+        csv_filename="orders_initial_70.csv",   # ★ 여기
         table_name="orders",
         parse_dates=[
             "order_purchase_timestamp",
@@ -85,9 +85,9 @@ def main():
         ]
     )
 
-    # 4. order_items
+    # 4. order_items - 70%에 해당하는 아이템만 적재
     load_table(
-        csv_filename="olist_order_items_dataset.csv",
+        csv_filename="order_items_initial_70.csv",   # ★ 여기
         table_name="order_items",
         parse_dates=[
             "shipping_limit_date",
@@ -95,7 +95,6 @@ def main():
     )
 
     print("\n=== 모든 테이블 초기 적재 완료 ===")
-
 
 
 if __name__ == "__main__":

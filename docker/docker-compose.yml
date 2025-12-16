@@ -1,11 +1,10 @@
-version: '3.8'
-
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: zookeeper
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
     ports:
       - "2181:2181"
     networks:
@@ -17,13 +16,22 @@ services:
     depends_on:
       - zookeeper
     ports:
-      - "9092:9092"
+      - "9092:9092"   # 호스트: localhost:9092
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+
+      # 내부/외부 리스너 분리 (같은 포트 쓰면 바로 죽음)
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+
+      # 단일 브로커 필수 옵션(커넥트 토픽 생성 안정화)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
     networks:
       - de-net
 
@@ -38,10 +46,10 @@ services:
       "--binlog-row-image=FULL"
     ]
     environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: ecommerce
-      MYSQL_USER: appuser
-      MYSQL_PASSWORD: apppass
+      MYSQL_ROOT_PASSWORD: "root"
+      MYSQL_DATABASE: "ecommerce"
+      MYSQL_USER: "appuser"
+      MYSQL_PASSWORD: "apppass"
     ports:
       - "3306:3306"
     volumes:
@@ -50,7 +58,7 @@ services:
       - de-net
 
   kafka-connect:
-    image: debezium/connect:2.7
+    image: debezium/connect:2.7.3.Final
     container_name: kafka-connect
     depends_on:
       - kafka
@@ -58,18 +66,45 @@ services:
     ports:
       - "8083:8083"
     environment:
-      BOOTSTRAP_SERVERS: kafka:9092
-      GROUP_ID: 1
-      CONFIG_STORAGE_TOPIC: debezium_connect_config
-      OFFSET_STORAGE_TOPIC: debezium_connect_offsets
-      STATUS_STORAGE_TOPIC: debezium_connect_status
-      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      BOOTSTRAP_SERVERS: "kafka:29092"
+      GROUP_ID: "1"
+      CONFIG_STORAGE_TOPIC: "debezium_connect_config"
+      OFFSET_STORAGE_TOPIC: "debezium_connect_offsets"
+      STATUS_STORAGE_TOPIC: "debezium_connect_status"
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
       KEY_CONVERTER_SCHEMAS_ENABLE: "true"
       VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
-      CONFIG_STORAGE_REPLICATION_FACTOR: 1
-      OFFSET_STORAGE_REPLICATION_FACTOR: 1
-      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+    networks:
+      - de-net
+
+  spark-master:
+    image: spark:3.5.7-java17-python3
+    container_name: spark-master
+    hostname: spark-master
+    ports:
+      - "18080:8080"
+      - "7077:7077"
+    volumes:
+      - ..:/workspace
+    command: ["/bin/bash", "-lc", "/opt/spark/sbin/start-master.sh -p 7077 --webui-port 8080 && tail -f /dev/null"]
+    networks:
+      - de-net
+
+  spark-worker:
+    image: spark:3.5.7-java17-python3
+    container_name: spark-worker
+    hostname: spark-worker
+    depends_on:
+      - spark-master
+    ports:
+      - "18081:8081"
+    volumes:
+      - ..:/workspace
+    command: ["/bin/bash", "-lc", "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 --webui-port 8081 && tail -f /dev/null"]
     networks:
       - de-net
 
