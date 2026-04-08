@@ -6,17 +6,24 @@
 
     "database.hostname": "mysql",
     "database.port": "3306",
-    "database.user": "appuser",
-    "database.password": "apppass",
+    "database.user": "debezium",
+    "database.password": "dbz",
 
     "database.server.id": "184054",
     "topic.prefix": "ecommerce",
 
     "database.include.list": "ecommerce",
+    "table.include.list": "ecommerce.customers,ecommerce.products,ecommerce.orders,ecommerce.order_items",
+
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "none",
+
+    "time.precision.mode": "connect",
+    "decimal.handling.mode": "double",
+
+    "include.schema.changes": "true",
 
     "schema.history.internal.kafka.bootstrap.servers": "kafka:29092",
-    "schema.history.internal.kafka.topic": "schema-changes.ecommerce",
-
-    "include.schema.changes": "true"
+    "schema.history.internal.kafka.topic": "schema-changes.ecommerce"
   }
 }
