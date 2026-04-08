@@ -19,6 +19,9 @@ error_log.txt
 # 데이터/결과 (원하면 나중에 조정)
 data/*.csv
 cdc_output/
+checkpoints/
+*.parquet
+spark-warehouse/
 
 # 기타
 .DS_Store
