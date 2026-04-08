@@ -2,14 +2,22 @@ import os
 import pandas as pd
 from sqlalchemy import create_engine
 
+# 프로젝트 루트의 .env 자동 로드 (없어도 스킵)
+try:
+    from dotenv import load_dotenv
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    load_dotenv(os.path.join(_ROOT, ".env"))
+except ImportError:
+    pass  # python-dotenv 미설치 시 OS 환경변수에서 직접 읽음
+
 # =====================
-# DB 접속 설정
+# DB 접속 설정 (환경변수에서 읽음, 기본값은 로컬 docker-compose와 일치)
 # =====================
-DB_USER = "appuser"      # docker-compose의 MYSQL_USER
-DB_PASS = "apppass"      # docker-compose의 MYSQL_PASSWORD
-DB_HOST = "127.0.0.1"
-DB_PORT = 3307           # docker-compose에서 3307:3306으로 매핑
-DB_NAME = "ecommerce"    # MYSQL_DATABASE
+DB_USER = os.environ["MYSQL_USER"]
+DB_PASS = os.environ["MYSQL_PASSWORD"]
+DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.environ.get("DB_PORT", "3306"))
+DB_NAME = os.environ.get("MYSQL_DATABASE", "ecommerce")
 
 DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
