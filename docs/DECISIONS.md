@@ -330,6 +330,170 @@
 
 ---
 
+### ADR-008: Event Replayer 구현 세부 설계 (2026-04-08)
+
+**Context**: ADR-003에서 "시간 기반 Event Replayer"를 도입하기로 결정했지만, 실제 구현에는 **압축 비율 선택, CLI 스펙, MySQL write 전략, UPDATE 이벤트 주입 방법, 재시작 정책** 등 구체 결정이 필요하다. 이 ADR은 `scripts/replay_orders.py` 의 구현 계약을 확정한다.
+
+**데이터 계측 결과** (`orders_future_30/part-00000-*.csv`):
+
+| 항목 | 값 |
+|------|----|
+| 행 수 | 29,833 |
+| 원본 시간 범위 | 2018-04-13 21:53 UTC → 2018-10-17 17:30 UTC |
+| 원본 span | **186.8 일 (≈ 6개월)** |
+| `order_status` 분포 | delivered 29,254 / shipped 252 / canceled 196 / invoiced 72 / unavailable 48 / processing 11 |
+| `order_purchase_timestamp` null | 0 |
+
+---
+
+#### 결정 1: 시간 압축 단위 — "목표 재생 시간" 방식
+
+**Decision**: 사용자가 **총 재생 시간(분)** 을 지정하면 스크립트가 compression ratio를 자동 계산. 기본값 **10분**.
+
+**Alternatives**:
+| 옵션 | 평가 |
+|------|------|
+| `--compression-ratio 27000` (고정 배수) | 데이터 span이 바뀌면 재계산 필요, 직관적이지 않음 |
+| **`--duration-minutes 10` (목표 시간)** | 데이터 기간과 무관하게 "10분짜리 시나리오"를 만든다는 의도가 명확 |
+| `--events-per-second 50` (고정 속도) | 원본 burst/lull 패턴 소실 → ADR-003 정신 위반 |
+
+**Rationale**:
+- **10분이 기본**인 이유: 29,833 events / 600s = **평균 ~50 events/s**. 로컬 Debezium + 단일 Kafka 브로커에서 여유 있게 처리 가능한 수준. 더 짧게 하면 burst 구간에서 binlog tailing이 밀릴 수 있고, 더 길게 하면 검증 사이클이 느려진다.
+- 압축 비율로 환산하면 `186.8일 / 10분 ≈ 26,900x` — 내부 구현은 이 ratio로 환산해 `time.sleep()` 계산에 사용.
+- `--compression-ratio` 플래그도 남겨두되, `--duration-minutes`와 상호 배타(`argparse` mutually exclusive group).
+
+**Trade-offs**:
+- (-) "실시간"이 아니라는 점을 README에서 명시해야 함
+- (+) 원본 burst 패턴은 보존됨 (이벤트 간 상대 시간차는 동일 비율로 유지)
+- (+) 10분짜리 짧은 실행으로 CI/검증 루프 구축 가능
+
+---
+
+#### 결정 2: MySQL write 전략 — 건당 INSERT + autocommit
+
+**Decision**: 한 건씩 `INSERT` 후 **즉시 commit**. 배치 insert 사용하지 않음.
+
+**Alternatives**:
+| 옵션 | 평가 |
+|------|------|
+| `executemany` 배치 insert (100건 단위) | 한 트랜잭션 = 한 commit → binlog에 이벤트 덩어리로 찍힘 → **ADR-003의 "연속 CDC 이벤트" 정신 위반** |
+| **건당 INSERT + autocommit** | 각 INSERT가 별도 binlog 이벤트 → Debezium이 초당 50건의 개별 CDC 이벤트로 포착 |
+| LOAD DATA INFILE | 벌크 로드 용도, 연속 이벤트 생성 의도와 정반대 |
+
+**Rationale**:
+- 이 Replayer의 목적은 "벌크 적재"가 아니라 "**실시간처럼 보이는 CDC 이벤트 스트림 생성**"이다. 건당 커밋이 유일하게 이 목적에 부합한다.
+- pandas/SQLAlchemy 대신 `pymysql` 직접 사용 — SQLAlchemy ORM 레이어는 이 단순 INSERT에 오버헤드이고, connection 재사용 제어가 직관적이지 않음.
+
+**Trade-offs**:
+- (-) 29,833 commit → 단일 프로세스 기준 ~10분간 지속 부하. 로컬 개발 머신에는 무시 가능.
+- (+) Debezium이 각 INSERT를 개별 `op=c` 이벤트로 발행 → Kafka 토픽에서 연속 이벤트 확인 가능.
+
+---
+
+#### 결정 3: 중복/FK 위반 처리 — `INSERT IGNORE` + 로그
+
+**Decision**: SQL은 `INSERT IGNORE INTO orders ...` 사용. skip된 건은 WARN 로그.
+
+**이유**:
+- **재시작 안전성(idempotency)**: 중간에 스크립트가 죽거나 사용자가 Ctrl+C로 끊었을 때, 동일 CSV를 다시 돌려도 이미 들어간 `order_id`는 PK 충돌로 조용히 skip. offset 기반 재시작 로직을 구현하지 않아도 됨 → **학습 프로젝트에 적합한 단순성**.
+- **FK 위반 대응**: `customer_id`가 `customers` 테이블에 없을 때 `INSERT IGNORE`는 FK 위반도 조용히 skip. 단, 이 경우엔 count를 따로 집계해 경고.
+
+**기각된 대안**:
+- Offset 파일(`.replay_state.json`) 기반 재시작 — 명시적이지만 구현 복잡도 ↑, 학습 프로젝트엔 과잉.
+- `ON DUPLICATE KEY UPDATE` — "이전 값을 덮어쓴다"는 의미 추가돼 의도 불명확.
+
+**Trade-offs**:
+- (-) `INSERT IGNORE` 는 FK 위반과 중복 PK를 구분 없이 삼킴 → 스크립트가 `SELECT COUNT(*)` 로 before/after 비교해 skip 원인을 사후 분리 가능하도록 함.
+- (+) "CTRL+C 후 재실행해도 망가지지 않음" — 데모/면접 시연 친화적.
+
+---
+
+#### 결정 4: UPDATE 이벤트 주입 — 옵트인, 상태 전이 1회
+
+**Decision**: `--include-updates` 플래그 활성화 시, INSERT 후 **1~3초 내에 동일 order_id에 대해 `order_status` UPDATE 1건 발행**. 기본 비율 `--update-ratio 0.1` (10%).
+
+**상태 전이 규칙**: 원본 CSV의 최종 상태가 `delivered`인 행을 대상으로:
+1. 최초 INSERT 시 `order_status='invoiced'` 로 덮어씀 (나머지 컬럼은 원본 유지)
+2. 1~3초 후 `UPDATE orders SET order_status='delivered', order_delivered_customer_date=... WHERE order_id=?`
+
+**Alternatives**:
+| 옵션 | 평가 |
+|------|------|
+| **opt-in UPDATE 주입 (기본 OFF)** | insert-only 모드로 빠른 검증 가능, updates는 별도 테스트 |
+| 항상 UPDATE 주입 | 단순하지만 빠른 디버깅 루프 방해 |
+| 2~3단계 상태 전이 (invoiced→shipped→delivered) | 더 현실적이지만 타이밍 복잡, 이 프로젝트 목적엔 과잉 — UPDATE 이벤트가 발생하는지만 증명하면 충분 |
+| DELETE 이벤트 주입 | ADR-006 개정에서 tombstones 기각했고 log compaction 미사용 → 의미 없음 |
+
+**Rationale**:
+- Debezium CDC 파이프라인이 **`op=c`만이 아니라 `op=u`도 정상 처리하는지** 증명해야 한다. 10% 비율이면 ~2,980건의 UPDATE 이벤트 → 충분히 유의미한 샘플.
+- 단계 하나(invoiced→delivered)만 구현하는 이유: 학습 목적상 "UPDATE 이벤트 `before`/`after` 페이로드 관찰" 이면 충분. 다단계 전이는 over-engineering.
+
+**Trade-offs**:
+- (-) 인위적 상태 전이 — 원본 데이터 분포를 왜곡
+- (-) UPDATE 시점이 실제 Olist의 배송 주기와 무관한 랜덤 지연
+- (+) `op=u` 이벤트 생성 증명 가능, ADR-004의 "exactly-once 증명" 에 UPDATE도 포함 가능
+
+---
+
+#### 결정 5: CLI 스펙
+
+```
+python scripts/replay_orders.py \
+  [--csv PATH]                        # 기본: spark-submit/data/orders_future_30/part-00000-*.csv
+  [--duration-minutes INT]            # 총 재생 시간 (기본 10)
+  [--compression-ratio FLOAT]         # 대안: 고정 비율 (duration-minutes와 상호 배타)
+  [--limit INT]                       # 처음 N건만 (테스트용, 기본 전체)
+  [--include-updates]                 # UPDATE 주입 활성화 (기본 OFF)
+  [--update-ratio FLOAT]              # UPDATE 비율 (기본 0.1)
+  [--update-delay-range MIN,MAX]      # UPDATE 지연 범위 초 (기본 1,3)
+  [--dry-run]                         # DB 안 건드리고 plan만 출력
+  [--log-level LEVEL]                 # 기본 INFO
+```
+
+**핵심 동작**:
+1. `.env` 로드 → `MYSQL_USER`, `MYSQL_PASSWORD`, `DB_HOST`, `DB_PORT`, `MYSQL_DATABASE`
+2. CSV 읽고 `order_purchase_timestamp` 오름차순 정렬
+3. `--dry-run` 시: 이벤트 수, span, 계산된 ratio, 예상 총 소요시간, 첫/마지막 timestamp만 출력하고 종료
+4. 실제 실행 시: `pymysql` autocommit 연결, 루프 돌며 `time.sleep((next_ts - prev_ts) / ratio)` 후 INSERT
+5. 종료 시 요약 출력: inserted / skipped / updates_pending / elapsed / planned / drift
+
+---
+
+#### 결정 6: 관측 지표 (ADR-004 연장)
+
+Replayer가 stdout/로그로 출력할 지표:
+
+| 지표 | 의미 | 왜 중요 |
+|------|------|---------|
+| `inserted` | 성공 INSERT 수 | 완주 검증 |
+| `skipped_pk` | PK 중복 skip 수 | idempotency 확인 (재실행 시 > 0) |
+| `skipped_fk` | FK 위반 skip 수 | customers 테이블 무결성 검증 |
+| `updates_sent` | 발행된 UPDATE 수 | `op=u` 이벤트 생성 증명 |
+| `planned_seconds` | 계산된 총 재생 시간 | 설정 투명성 |
+| `actual_seconds` | 실제 소요 시간 | 드리프트 측정 |
+| `drift_pct` | `(actual - planned) / planned` | 50 events/s를 로컬이 소화했는가 |
+
+`drift_pct`가 일관되게 10% 이상이면 → `--duration-minutes`를 늘려야 한다는 신호 (ADR-008 후속 개정 트리거).
+
+---
+
+**Trade-offs 총정리**:
+- (-) 진짜 실시간 아님, 단일 프로세스, 인위적 UPDATE
+- (+) 원본 burst/lull 패턴 보존
+- (+) idempotent 재실행
+- (+) 10분 실행으로 빠른 검증 루프
+- (+) MySQL → Debezium → Kafka 경로를 **그대로** 사용 → CDC 학습 목적 달성
+
+**How to verify** (ADR-008 구현 완료 기준):
+1. `--dry-run` 으로 29,833 rows / 186.8일 span / ratio ~26,900x 출력 확인
+2. `--limit 10 --dry-run` 으로 소규모 계획 확인
+3. `docker compose up` 상태에서 `--limit 10` 실제 실행 → MySQL `orders` 테이블 10건 증가 확인
+4. 같은 명령 재실행 → `skipped_pk=10, inserted=0` 확인 (idempotency)
+5. `kafka-console-consumer --topic ecommerce.ecommerce.orders` 에서 10건의 `op=c` 이벤트 관찰
+6. `--limit 100 --include-updates --update-ratio 0.5` 실행 → `op=u` 이벤트 ~50건 관찰
+
+---
+
 ## 6. 수정된 개선 우선순위
 
 | 우선순위 | 항목 | Why | 완료 증명 |
