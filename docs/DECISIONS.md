@@ -271,6 +271,14 @@
 
 ### ADR-006: Debezium 옵션 — 학습 목적 튜닝
 
+> ⚠️ **ADR-006 개정 (2026-04-08)**: 아래 옵션 중 일부는 **이 프로젝트 환경에서 검증 불가능**하여 기각/연기한다.
+>
+> - **기각**: `tombstones.on.delete=true` — 이 프로젝트는 Parquet sink를 쓰고 log compaction을 사용하지 않는다. tombstone 동작을 검증할 코드 경로가 없으므로 "버즈워드 나열"이 된다.
+> - **Phase 5로 연기**: `schema.history.internal.skip.unparseable.ddl=true` — schema evolution 테스트에서 필요할 때 추가한다. 그 전엔 의미 없는 안전장치.
+> - **유지**: `snapshot.mode`, `snapshot.locking.mode`, `include.schema.changes`, `table.include.list`, `time.precision.mode`, `decimal.handling.mode` — 각각 이 프로젝트 환경에서 실제 효과가 있거나 학습 가치가 있음.
+>
+> 원칙: "문서에 적혔다고 무조건 도입하지 말고, 실제 검증 가능한 것만 도입한다."
+
 **Context**: 현재 `register-mysql-debezium.json` 에 기본값만 사용. 기본값으로도 동작은 하지만, 각 옵션의 의미를 이해하고 있음을 증명해야 함.
 
 **Decision**: 아래 옵션을 명시적으로 설정하고 각각의 이유를 주석으로 기록.
@@ -288,6 +296,37 @@
 **Rationale**:
 - 로컬에선 성능 차이 없지만, **각 옵션의 의미를 문서화**하는 게 학습 성과
 - 면접에서 "왜 `snapshot.locking.mode=none`으로 했어요?" 질문에 답할 수 있어야 함
+
+---
+
+### ADR-007: Debezium replication 유저 분리 (2026-04-08)
+
+**Context**: Debezium이 MySQL binlog를 읽으려면 `REPLICATION SLAVE, REPLICATION CLIENT` 권한이 필요하다. 현재 `appuser`는 `ecommerce` DB에 대한 기본 권한만 있어 Debezium 구동 자체가 불가능. P0 작업 중 이 문제가 드러남.
+
+**Decision**: `debezium` 전용 유저를 `init.sql`에서 생성. `appuser`는 애플리케이션 CRUD 권한만, `debezium`은 replication 권한만 갖도록 분리.
+
+**Alternatives**:
+| 옵션 | 평가 |
+|------|------|
+| `appuser`에 REPLICATION 권한 추가 | 단순하지만 앱 유저와 복제 유저 권한이 섞임 → 권한 최소화 원칙 위반 |
+| **`debezium` 전용 유저 신규 생성** | 권한 분리, 운영 관행, 면접에서 설명 가능 |
+| 외부 Secrets Manager로 자격증명 관리 | 로컬 단일 브로커 학습 환경에 과잉 |
+
+**Rationale**:
+- **권한 최소화(least privilege)** 는 DB 운영의 기본 원칙. `appuser`가 탈취됐을 때 binlog 전체가 유출되면 안 됨.
+- 비용은 `init.sql`에 3줄 추가뿐 — 기술 도입이 아니라 **SQL 설정 변경**이므로 "프로젝트 사이즈에 안 맞는 기술" 범주에 해당하지 않음.
+- 면접 포인트: "왜 전용 유저?" → "binlog 읽기 권한은 강력해서 앱 유저와 분리했습니다."
+
+**Trade-offs**:
+- (-) 비밀번호를 하나 더 관리해야 함
+- (-) `debezium` 비밀번호가 `init.sql`에 하드코딩됨. MySQL `initdb`가 환경변수 치환을 지원하지 않기 때문. **운영 환경에선 Secrets Manager/Vault가 필요**하다는 한계를 문서화.
+- (+) 권한 분리 구조를 git/코드로 증명
+- (+) 운영 관행 학습
+
+**How to verify**:
+- `SHOW GRANTS FOR 'appuser'@'%'` → `ecommerce` DB 권한만
+- `SHOW GRANTS FOR 'debezium'@'%'` → `REPLICATION SLAVE`, `REPLICATION CLIENT` 포함
+- Debezium 커넥터가 `debezium` 유저로 접속하여 binlog tailing 성공
 
 ---
 

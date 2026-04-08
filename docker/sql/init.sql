@@ -69,3 +69,12 @@ CREATE TABLE order_items (
   CONSTRAINT fk_order_items_product
     FOREIGN KEY (product_id) REFERENCES products(product_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ADR-007: Debezium 전용 replication 유저
+-- appuser와 분리하여 권한 최소화(least privilege) 원칙 준수.
+-- 비밀번호는 MySQL initdb가 환경변수 치환을 지원하지 않아 여기에 하드코딩됨 —
+-- 운영 환경에선 Secrets Manager/Vault가 필요하다 (ADR-007 Trade-offs 참조).
+CREATE USER IF NOT EXISTS 'debezium'@'%' IDENTIFIED BY 'dbz';
+GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT
+  ON *.* TO 'debezium'@'%';
+FLUSH PRIVILEGES;
