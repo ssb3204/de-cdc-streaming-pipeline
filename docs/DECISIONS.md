@@ -13,6 +13,16 @@
 3. [잘못된 첫 개선 계획 (반면교사)](#3-잘못된-첫-개선-계획-반면교사)
 4. [비판적 재검토 — 던진 질문들](#4-비판적-재검토--던진-질문들)
 5. [기술 선택 재검토 (ADR)](#5-기술-선택-재검토-adr)
+   - [ADR-001 배치 적재 도구 — pandas vs Spark JDBC](#adr-001-배치-적재-도구--pandas-vs-spark-jdbc)
+   - [ADR-002 데이터 포맷 — CSV 원본 유지 vs Parquet 전환](#adr-002-데이터-포맷--csv-원본-유지-vs-parquet-전환)
+   - [ADR-003 실시간 흐름 재현 — 시간 기반 Event Replayer](#adr-003-실시간-흐름-재현--시간-기반-event-replayer)
+   - [ADR-004 측정 지표 — Throughput 대신 Correctness/Latency](#adr-004-측정-지표--throughput-대신-correctnesslatency)
+   - [ADR-005 Checkpoint 영구 저장](#adr-005-checkpoint-영구-저장)
+   - [ADR-006 Debezium 옵션 — 학습 목적 튜닝](#adr-006-debezium-옵션--학습-목적-튜닝)
+   - [ADR-007 Debezium replication 유저 분리](#adr-007-debezium-replication-유저-분리-2026-04-08)
+   - [ADR-008 Event Replayer 구현 세부 설계](#adr-008-event-replayer-구현-세부-설계-2026-04-08)
+   - [ADR-009 Spark Structured Streaming 선택의 재검토](#adr-009-spark-structured-streaming-선택의-재검토-2026-04-09)
+   - [ADR-010 End-to-end Latency 측정 설계](#adr-010-end-to-end-latency-측정-설계-2026-04-10)
 6. [수정된 개선 우선순위](#6-수정된-개선-우선순위)
 7. [이력서 문장 Before/After](#7-이력서-문장-beforeafter)
 8. [학습 노트](#8-학습-노트)
@@ -615,3 +625,165 @@ Kafka는 원래 at-least-once. exactly-once 보장은:
 
 **이 문서는 살아있는 문서다.** 새 결정이 추가될 때마다 ADR-007, ADR-008... 로 append한다.
 기각된 옵션도 지우지 않고 "왜 기각했는지" 남긴다 — 그게 학습 자료다.
+
+---
+
+### ADR-009: Spark Structured Streaming 선택의 재검토 (2026-04-09)
+
+**Context**: 이 프로젝트를 진행하면서 자연스럽게 다음 질문이 생겼다.
+- "Kafka를 쓰는데 왜 꼭 Spark가 필요한가?"
+- "이 데이터 규모(~350k rows, ~50MB)에 Spark가 적합한가?"
+- "집에서 대용량 데이터와 Kubernetes 없이 Kafka를 학습하는 게 의미 있는가?"
+
+이 ADR은 그 질문에 대한 답이다.
+
+**결론부터**: Kafka를 사용하는 데 Spark는 필수가 아니다. 그리고 이 프로젝트에서 Spark는 과한 도구다. 그 사실을 프로젝트 진행 중에 직접 발견한 것이 이 ADR의 핵심 가치다.
+
+---
+
+**Kafka 소비에 Spark가 필요한가?**
+
+Kafka에서 데이터를 읽는 방법은 여러 가지다:
+
+| 방법 | 복잡도 | 적합한 규모 |
+|------|--------|------------|
+| Python Consumer (`confluent-kafka`) | 낮음 | 소~중규모 |
+| Faust | 중간 | Python 스트림 처리 |
+| Kafka Streams | 중간 | Java/Kotlin, Kafka 네이티브 |
+| ksqlDB | 낮음 | SQL 기반 스트림 처리 |
+| **Spark Structured Streaming** | 높음 | 대규모 분산 처리 필요 시 |
+
+→ **이 프로젝트에 Python Consumer로 충분하다.**
+
+---
+
+**그럼 왜 Spark를 쓰나?**
+
+원본 프로젝트의 스택이 `Kafka → Spark Structured Streaming`이었고, 처음엔 그대로 따라갔다.
+진행하면서 과하다는 걸 직접 발견했고, 그 발견을 기각 근거로 남기는 대신 다음 이유로 유지를 결정했다:
+
+**Decision**: Spark Structured Streaming 유지. 단, 사용 목적을 재정의.
+
+| 목적 | 설명 |
+|------|------|
+| exactly-once semantics 검증 | checkpoint + idempotent Parquet sink 조합을 실제 코드로 증명 |
+| offset 관리 학습 | Spark가 Kafka offset을 checkpoint에 어떻게 저장하고 재시작 시 복구하는지 관찰 |
+| Kafka → Parquet 패턴 습득 | 실무에서 자주 쓰이는 CDC → Data Lake 패턴의 최소 구현 |
+
+**핵심**: "Kafka 처리에 Spark가 필요해서"가 아니라, "Spark의 스트리밍 처리 방식(checkpoint, exactly-once, Parquet sink)을 이 파이프라인 위에서 학습하기 위해" 사용한다.
+
+---
+
+**로컬에서 대용량 Kafka를 재현할 수 없는 문제**
+
+기업 환경의 Kafka: 수십 개 브로커 + Kubernetes + 초당 수백만 건
+로컬 환경의 현실: 단일 브로커 + Docker Compose + 초당 ~50건
+
+이 간극을 메우려는 시도(파티션 늘리기, throughput 측정 등)는 ADR-004에서 이미 기각했다.
+로컬에서 증명 가능한 것은 **규모가 아니라 동작 원리**다:
+- offset이 어떻게 추적되는가
+- 재시작 시 어디서부터 다시 읽는가
+- exactly-once가 어떻게 보장되는가
+
+이것들은 데이터 규모와 무관하게 단일 브로커에서도 동일하게 동작한다.
+
+**Alternatives**:
+| 대안 | 평가 |
+|------|------|
+| Python Consumer (`confluent-kafka` + `pyarrow`) | 이 규모엔 더 적합. JVM 없음, 빠른 시작 |
+| Faust | Python 스트림 처리, Kafka 네이티브하지만 학습 자료 적음 |
+| **Spark Structured Streaming 유지** | 과하지만 exactly-once/checkpoint 패턴 학습 가치 있음 |
+| Spark + Python Consumer 둘 다 구현 | 비교 가능하지만 프로젝트 범위 과잉 |
+
+**Trade-offs**:
+- (-) JVM 시작 비용 (~10~30초), 이 규모에 명백한 오버엔지니어링
+- (-) Spark 없이도 동일한 파이프라인 구현 가능
+- (+) exactly-once semantics와 checkpoint 동작을 코드 레벨에서 이해
+- (+) "왜 Spark를 썼는가"에 대한 답을 직접 발견하고 문서화했다는 것 자체가 포트폴리오 가치
+
+**면접 대응**:
+> "이 데이터 규모면 Python Consumer로 충분하지 않나요?"
+>
+> "맞습니다. 처음엔 원본 스택을 그대로 따라갔다가 진행하면서 직접 그 점을 발견했습니다.
+> Spark를 유지한 이유는 처리 성능 때문이 아니라, exactly-once semantics와 checkpoint 기반 재시작 복구를
+> 실제 코드로 검증하기 위해서입니다. 프로덕션에서 이 데이터 규모라면 Python Consumer를 선택했을 겁니다."
+
+---
+
+### ADR-010: End-to-end Latency 측정 설계 (2026-04-10)
+
+**Context**: ADR-004에서 "throughput 대신 latency를 측정한다"고 결정했다. Phase 4는 그 측정 체계를 실제로 구현하는 단계다. 측정 방법을 어떻게 설계하느냐에 따라 신뢰도가 달라진다.
+
+**측정 대상**:
+```
+MySQL 이벤트 발생 시각 (ts_ms)
+        ↓
+Spark Parquet 저장 시각 (processed_at)
+
+End-to-end latency = processed_at − ts_ms
+```
+
+**Decision**: Debezium `payload.ts_ms` vs Spark `current_timestamp()` 차이를 Parquet 컬럼으로 기록.
+
+**구현**:
+- `stream_cdc.py`: `.withColumn("processed_at", current_timestamp())` 추가
+- `scripts/measure_latency.py`: Parquet 읽어 p50/p95/p99 집계 출력
+
+**Alternatives**:
+
+| 방법 | 평가 |
+|------|------|
+| `payload.ts_ms` vs `payload.source.ts_ms` 비교 | Debezium 내부 처리 latency만 측정. Spark 처리 시간 제외 |
+| Kafka `timestamp` vs `processed_at` 비교 | Kafka 브로커 도달 ~ Spark 처리 latency. DB 커밋 시점 제외 |
+| **`payload.ts_ms` vs `processed_at`** | MySQL 커밋 ~ Parquet 저장 전 구간 측정. 가장 의미 있는 end-to-end |
+| 별도 latency 토픽 | 오버엔지니어링. 이 규모에 불필요 |
+
+**`ts_ms` 필드 선택 이유**:
+
+Debezium 이벤트에는 두 개의 타임스탬프가 있다:
+```json
+{
+  "payload": {
+    "ts_ms": 1712345678000,        // Debezium이 binlog를 읽은 시각
+    "source": {
+      "ts_ms": 1712345677500       // 실제 MySQL 트랜잭션 커밋 시각
+    }
+  }
+}
+```
+
+`payload.ts_ms`(Debezium 처리 시각)를 사용하는 이유:
+- `stream_cdc.py`에서 이미 `get_json_object(col("v"), "$.payload.ts_ms")`로 추출 중
+- 로컬 환경에서 두 값의 차이(~수 ms)는 측정 노이즈 내
+- 구현 단순성 > 정밀도 (이 프로젝트 목적에 적합)
+
+**로컬 환경 주의사항**:
+- 측정값은 Docker 네트워크 + 로컬 I/O 기반 → 절대값보다 **상대 비교**(INSERT vs UPDATE, 테이블별)가 의미 있음
+- 음수 latency 발생 시 시계 스큐 또는 기존 Parquet 데이터(processed_at 없음) → 필터링
+
+**Trade-offs**:
+- (-) `payload.source.ts_ms`(실제 DB 커밋 시각) 대신 Debezium 처리 시각 사용 → ~수 ms 오차
+- (-) 로컬 단일 브로커 측정값은 프로덕션과 비교 불가
+- (+) 코드 변경 최소 (컬럼 1개 추가)
+- (+) 별도 측정 인프라 불필요 (Parquet 재활용)
+- (+) 이력서에 "p50 Xms, p95 Xms" 수치 기재 가능
+
+**실측 결과 (2026-04-10, 로컬 Docker 환경)**:
+
+환경: Docker single-node Kafka + Spark Structured Streaming, Windows 11 로컬
+이벤트: INSERT 40건(replay_orders.py) + UPDATE 30건(shipped→delivered 직접 UPDATE)
+
+```
+전체 70건:   p50= 298ms  p95= 511ms  p99=1365ms  max=1460ms
+INSERT 40건: p50= 268ms  p95= 941ms  p99=1406ms  max=1460ms
+UPDATE 30건: p50= 298ms  p95= 301ms  p99= 301ms  max= 301ms
+```
+
+관찰:
+- UPDATE가 INSERT보다 latency 분포가 일정 (p95 301ms vs 941ms)
+  → UPDATE는 짧은 시간 내 batch 실행, INSERT는 시간 압축 replay이므로 간격 편차 존재
+- p99 > p95 격차 (1365ms vs 511ms)는 INSERT 중 일부 micro-batch trigger 지연에 기인
+- 로컬 환경 절대값보다 INSERT/UPDATE 상대 비교가 유의미
+
+결론: Debezium → Kafka → Spark → Parquet 경로에서 **p50 ≈ 300ms, p95 ≈ 500ms** 확인.
+이 수치는 이력서/포트폴리오 기재용이며, 프로덕션 멀티브로커 환경과 직접 비교 불가.

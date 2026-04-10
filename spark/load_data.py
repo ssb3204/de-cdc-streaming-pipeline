@@ -1,4 +1,6 @@
+import glob
 import os
+
 import pandas as pd
 from sqlalchemy import create_engine
 
@@ -23,15 +25,21 @@ DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAM
 
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 
-# CSV 파일이 있는 디렉토리 (위에 제안한 구조 기준)
+# split_orders_70_30.py(Spark)가 생성한 데이터 디렉토리
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = os.path.join(BASE_DIR, "spark-submit", "data")
 
 
 def load_table(csv_filename: str, table_name: str, parse_dates=None, chunksize: int = 10000):
     csv_path = os.path.join(DATA_DIR, csv_filename)
 
-    if not os.path.exists(csv_path):
+    # Spark 출력은 디렉토리(part-*.csv) 형태로 저장됨
+    if os.path.isdir(csv_path):
+        parts = sorted(glob.glob(os.path.join(csv_path, "part-*.csv")))
+        if not parts:
+            raise FileNotFoundError(f"part-*.csv 없음: {csv_path}")
+        csv_path = parts[0]
+    elif not os.path.exists(csv_path):
         raise FileNotFoundError(f"{csv_path} 파일이 존재하지 않습니다.")
 
     print(f"\n=== [{table_name}] {csv_path} 적재 시작 ===")
@@ -80,9 +88,9 @@ def main():
         parse_dates=None
     )
 
-    # 3. orders - 과거 70%만 적재
+    # 3. orders - 과거 70%만 적재 (Spark가 생성한 디렉토리)
     load_table(
-        csv_filename="orders_initial_70.csv",   # ★ 여기
+        csv_filename="orders_initial_70",
         table_name="orders",
         parse_dates=[
             "order_purchase_timestamp",
@@ -93,9 +101,9 @@ def main():
         ]
     )
 
-    # 4. order_items - 70%에 해당하는 아이템만 적재
+    # 4. order_items - 70%에 해당하는 아이템만 적재 (Spark가 생성한 디렉토리)
     load_table(
-        csv_filename="order_items_initial_70.csv",   # ★ 여기
+        csv_filename="order_items_initial_70",
         table_name="order_items",
         parse_dates=[
             "shipping_limit_date",

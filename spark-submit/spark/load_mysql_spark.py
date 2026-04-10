@@ -14,8 +14,8 @@ from pyspark.sql import functions as F
 MYSQL_HOST = os.getenv("MYSQL_HOST", "mysql")
 MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
 MYSQL_DB = os.getenv("MYSQL_DB", "ecommerce")
-MYSQL_USER = os.getenv("MYSQL_USER", "appuser")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "apppass")
+MYSQL_USER = os.environ["MYSQL_USER"]
+MYSQL_PASSWORD = os.environ["MYSQL_PASSWORD"]
 
 JDBC_URL = (
     f"jdbc:mysql://{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"

@@ -20,8 +20,15 @@ error_log.txt
 data/*.csv
 cdc_output/
 checkpoints/
+data/cdc_output/
 *.parquet
 spark-warehouse/
+
+# Garbage collection log (Claude Code 자동 기록, 커밋 불필요)
+.claude/garbage-collection.md
+
+# Spark dependency jars (workspace에 저장, git 추적 불필요)
+jars/*.jar
 
 # 기타
 .DS_Store
