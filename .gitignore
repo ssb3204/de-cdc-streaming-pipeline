@@ -37,6 +37,9 @@ spark-submit/data/order_items_future_30/
 # Spark dependency jars (workspace에 저장, git 추적 불필요)
 jars/*.jar
 
+# Debezium 커넥터 설정 (실제 패스워드 포함 — 템플릿에서 envsubst로 생성)
+docker/register-mysql-debezium.json
+
 # 기타
 .DS_Store
 Thumbs.db

@@ -100,10 +100,10 @@ docker compose up -d
 
 ### 4. Debezium 커넥터 등록
 
+커넥터 설정은 `.env`의 `DBZ_USER` / `DBZ_PASSWORD`를 템플릿에 주입해서 등록합니다.
+
 ```bash
-curl -X POST http://localhost:8083/connectors \
-  -H "Content-Type: application/json" \
-  -d @docker/register-mysql-debezium.json
+source .env && bash docker/register_connector.sh
 ```
 
 ### 5. 초기 데이터 적재 (70%)
