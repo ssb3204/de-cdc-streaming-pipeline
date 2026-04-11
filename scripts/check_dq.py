@@ -24,9 +24,11 @@ Layer 3 (Consistency):
 
 import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 try:
     from dotenv import load_dotenv
@@ -66,6 +68,14 @@ NULL_THRESHOLDS: dict[str, float] = {
     "order_items.price": 1.0,
 }
 
+# 행 수 허용 오차
+INITIAL_LOAD_RATIO: float = 0.7
+ROW_COUNT_TOLERANCE_PCT: float = 0.02
+ROW_COUNT_MIN_TOLERANCE: int = 10
+
+# consistency 커버리지 임계값
+MIN_COVERAGE_PCT: float = 95.0
+
 SEVERITY_PASS  = "[PASS]"
 SEVERITY_WARN  = "[WARN]"
 SEVERITY_FAIL  = "[FAIL]"
@@ -100,18 +110,18 @@ def record(severity: str, check: str, detail: str) -> None:
         SEVERITY_SKIP: "SKIP",
         SEVERITY_INFO: "INFO",
     }.get(severity, "?")
-    print(f"  {severity} [{tag}] {check}: {detail}")
+    logging.info("  %s [%s] %s: %s", severity, tag, check, detail)
 
 
 # ─────────────────────────────────────────────
 # DB 연결
 # ─────────────────────────────────────────────
 
-def get_connection():
+def get_connection() -> Any:
     try:
         import pymysql
     except ImportError:
-        print("[ERROR] pymysql not installed -- pip install pymysql")
+        logging.error("pymysql not installed -- pip install pymysql")
         sys.exit(1)
 
     return pymysql.connect(
@@ -124,13 +134,13 @@ def get_connection():
     )
 
 
-def query(conn, sql: str) -> list[dict]:
+def query(conn: Any, sql: str) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(sql)
         return cur.fetchall()
 
 
-def scalar(conn, sql: str):
+def scalar(conn: Any, sql: str) -> Any:
     rows = query(conn, sql)
     if rows:
         return list(rows[0].values())[0]
@@ -138,30 +148,28 @@ def scalar(conn, sql: str):
 
 
 # ─────────────────────────────────────────────
-# Layer 1: MySQL Source DQ
+# Layer 1: MySQL Source DQ — 서브함수
 # ─────────────────────────────────────────────
 
-def layer1_mysql(conn) -> None:
-    print("\n" + "=" * 55)
-    print("[ Layer 1: MySQL Source DQ ]")
-    print("=" * 55)
-
-    # 1-A. Row count (vs CSV 원본의 70%)
-    print("\n-- 1-A. Row count --")
+def _check_row_counts(conn: Any) -> None:
+    """1-A. Row count (vs CSV 원본의 70%)"""
+    logging.info("\n-- 1-A. Row count --")
     tables = ["orders", "customers", "order_items", "products"]
     for tbl in tables:
         cnt = scalar(conn, f"SELECT COUNT(*) FROM {_safe(tbl)}")
         expected_full = EXPECTED_ROWS[tbl]
-        expected_70 = int(expected_full * 0.7)
+        expected_70 = int(expected_full * INITIAL_LOAD_RATIO)
         expected = expected_70 if tbl in ("orders", "order_items") else expected_full
         diff = abs(cnt - expected)
-        tol = max(int(expected * 0.02), 10)  # 2% 허용
+        tol = max(int(expected * ROW_COUNT_TOLERANCE_PCT), ROW_COUNT_MIN_TOLERANCE)
         sev = SEVERITY_PASS if diff <= tol else SEVERITY_WARN
         record(sev, f"{tbl}.row_count",
                f"{cnt:,} (expected ~{expected:,}, diff={diff:,})")
 
-    # 1-B. PK null / 중복
-    print("\n-- 1-B. PK null / duplicate --")
+
+def _check_pk_integrity(conn: Any) -> None:
+    """1-B. PK null / 중복"""
+    logging.info("\n-- 1-B. PK null / duplicate --")
     pk_map = {
         "orders": "order_id",
         "customers": "customer_id",
@@ -173,10 +181,10 @@ def layer1_mysql(conn) -> None:
         dup_cnt = scalar(conn,
             f"SELECT COUNT(*) FROM "
             f"(SELECT {_safe(pk)} FROM {_safe(tbl)} GROUP BY {_safe(pk)} HAVING COUNT(*) > 1) t")
-        sev_null = SEVERITY_PASS if null_cnt == 0 else SEVERITY_FAIL
-        sev_dup  = SEVERITY_PASS if dup_cnt == 0 else SEVERITY_FAIL
-        record(sev_null, f"{tbl}.{pk}_null", f"{null_cnt}")
-        record(sev_dup,  f"{tbl}.{pk}_duplicate", f"{dup_cnt}")
+        record(SEVERITY_PASS if null_cnt == 0 else SEVERITY_FAIL,
+               f"{tbl}.{pk}_null", f"{null_cnt}")
+        record(SEVERITY_PASS if dup_cnt == 0 else SEVERITY_FAIL,
+               f"{tbl}.{pk}_duplicate", f"{dup_cnt}")
 
     # order_items는 복합PK (order_id + order_item_id)
     dup_items = scalar(conn,
@@ -189,8 +197,10 @@ def layer1_mysql(conn) -> None:
         "order_items.composite_pk_duplicate", f"{dup_items}"
     )
 
-    # 1-C. FK 무결성
-    print("\n-- 1-C. FK integrity --")
+
+def _check_fk_integrity(conn: Any) -> None:
+    """1-C. FK 무결성"""
+    logging.info("\n-- 1-C. FK integrity --")
     orphan_orders = scalar(conn,
         "SELECT COUNT(*) FROM orders o"
         "  LEFT JOIN customers c ON o.customer_id = c.customer_id"
@@ -208,15 +218,13 @@ def layer1_mysql(conn) -> None:
         "order_items.order_id FK orphan", f"{orphan_items}"
     )
 
-    # 1-D. 핵심 컬럼 null 비율
-    print("\n-- 1-D. Critical null rates --")
+
+def _check_null_rates(conn: Any) -> None:
+    """1-D. 핵심 컬럼 null 비율 — NULL_THRESHOLDS 단일 소스"""
+    logging.info("\n-- 1-D. Critical null rates --")
     null_checks = [
-        ("orders", "order_purchase_timestamp", 5.0),
-        ("orders", "order_status", 1.0),
-        ("orders", "customer_id", 0.0),
-        ("order_items", "order_id", 0.0),
-        ("order_items", "product_id", 0.0),
-        ("order_items", "price", 1.0),
+        (k.split(".")[0], k.split(".")[1], v)
+        for k, v in NULL_THRESHOLDS.items()
     ]
     for tbl, col, threshold in null_checks:
         total = scalar(conn, f"SELECT COUNT(*) FROM {_safe(tbl)}")
@@ -231,48 +239,62 @@ def layer1_mysql(conn) -> None:
                f"{pct:.1f}% ({null_cnt:,}/{total:,}){note}")
 
 
+def layer1_mysql(conn: Any) -> None:
+    logging.info("\n" + "=" * 55)
+    logging.info("[ Layer 1: MySQL Source DQ ]")
+    logging.info("=" * 55)
+
+    _check_row_counts(conn)
+    _check_pk_integrity(conn)
+    _check_fk_integrity(conn)
+    _check_null_rates(conn)
+
+
 # ─────────────────────────────────────────────
 # Layer 2: Parquet CDC DQ
 # ─────────────────────────────────────────────
 
-def _parse_json_field(val, field: str):
+def _parse_json_field(val: Any, field: str) -> Any:
     """after/before JSON 문자열에서 특정 필드 값 추출. 파싱 실패 시 None 반환."""
     if val is None:
         return None
     try:
         return json.loads(val).get(field)
-    except Exception:
+    except Exception as e:
+        logging.debug("JSON parse error for value %r: %s", val, e)
         return None
 
 
-def _json_parse_ok(val) -> bool:
+def _json_parse_ok(val: Any) -> bool:
     """after JSON 파싱 성공 여부. None은 파싱 대상이 아니므로 True."""
     if val is None:
         return True
     try:
         json.loads(val)
         return True
-    except Exception:
+    except Exception as e:
+        logging.debug("JSON parse error for value %r: %s", val, e)
         return False
 
 
-def _has_field_in_json(val, field: str) -> bool:
+def _has_field_in_json(val: Any, field: str) -> bool:
     """JSON 문자열에 특정 필드가 존재하는지 확인."""
     try:
         return field in json.loads(val) if val else False
-    except Exception:
+    except Exception as e:
+        logging.debug("JSON parse error for value %r: %s", val, e)
         return False
 
 
 def layer2_parquet() -> None:
-    print("\n" + "=" * 55)
-    print("[ Layer 2: Parquet CDC DQ ]")
-    print("=" * 55)
+    logging.info("\n" + "=" * 55)
+    logging.info("[ Layer 2: Parquet CDC DQ ]")
+    logging.info("=" * 55)
 
     try:
         import pandas as pd
     except ImportError:
-        print("[SKIP] pandas/pyarrow not installed")
+        logging.warning("pandas/pyarrow not installed -- skipping Layer 2")
         return
 
     if not ORDERS_PARQUET.exists():
@@ -289,14 +311,14 @@ def layer2_parquet() -> None:
     record(SEVERITY_INFO, "parquet.total_events", f"{total:,}")
 
     # 2-A. op 분포
-    print("\n-- 2-A. op distribution --")
+    logging.info("\n-- 2-A. op distribution --")
     op_counts = df["op"].value_counts().to_dict()
     for op, cnt in sorted(op_counts.items()):
         label = {"r": "READ(snapshot)", "c": "CREATE", "u": "UPDATE", "d": "DELETE"}.get(op, op)
         record(SEVERITY_INFO, f"parquet.op={op}", f"{cnt:,} ({label})")
 
     # 2-B. order_id 필드 존재 + null 체크
-    print("\n-- 2-B. Required field null check --")
+    logging.info("\n-- 2-B. Required field null check --")
     insert_rows = df[df["op"].isin(["r", "c"])].copy()
     if not insert_rows.empty:
         null_order_id = insert_rows["after"].map(
@@ -310,7 +332,7 @@ def layer2_parquet() -> None:
         )
 
     # 2-C. 스키마 컬럼 검증 (is_late_delivery)
-    print("\n-- 2-C. Schema evolution column check --")
+    logging.info("\n-- 2-C. Schema evolution column check --")
     update_rows = df[df["op"] == "u"].copy()
     if update_rows.empty:
         record(SEVERITY_SKIP, "parquet.is_late_delivery", "no UPDATE events found")
@@ -323,7 +345,7 @@ def layer2_parquet() -> None:
                f"UPDATE {len(update_rows)} events, {has_col} contain is_late_delivery")
 
     # 2-D. after 필드 파싱 실패율
-    print("\n-- 2-D. after parse failure rate --")
+    logging.info("\n-- 2-D. after parse failure rate --")
     parse_fail = (~df["after"].map(_json_parse_ok)).sum()
     pct = parse_fail / total * 100 if total else 0
     record(
@@ -337,10 +359,10 @@ def layer2_parquet() -> None:
 # Layer 3: MySQL vs Parquet Consistency
 # ─────────────────────────────────────────────
 
-def layer3_consistency(conn) -> None:
-    print("\n" + "=" * 55)
-    print("[ Layer 3: MySQL vs Parquet Consistency ]")
-    print("=" * 55)
+def layer3_consistency(conn: Any) -> None:
+    logging.info("\n" + "=" * 55)
+    logging.info("[ Layer 3: MySQL vs Parquet Consistency ]")
+    logging.info("=" * 55)
 
     try:
         import pandas as pd
@@ -360,10 +382,9 @@ def layer3_consistency(conn) -> None:
     df = pd.read_parquet(ORDERS_PARQUET)
 
     # 3-A. MySQL orders 수 vs Parquet 비 중복 order_id 수
-    print("\n-- 3-A. Unique order coverage --")
+    logging.info("\n-- 3-A. Unique order coverage --")
     mysql_orders = scalar(conn, "SELECT COUNT(DISTINCT order_id) FROM orders")
 
-    # after/before JSON에서 order_id 벡터화 추출
     ids_after = df["after"].map(lambda v: _parse_json_field(v, "order_id")).dropna()
     ids_before = (
         df["before"].map(lambda v: _parse_json_field(v, "order_id")).dropna()
@@ -372,17 +393,16 @@ def layer3_consistency(conn) -> None:
     parquet_order_ids: set[str] = set(ids_after) | set(ids_before)
     parquet_unique = len(parquet_order_ids)
 
-    # 비율: CDC가 MySQL 전체를 얼마나 커버하는가
     # Note: initial bulk load (69,608 rows) bypassed CDC and went directly to MySQL.
     # Only events from replay_orders.py (~129) are in Parquet. Low coverage is expected.
     coverage_pct = (parquet_unique / mysql_orders * 100) if mysql_orders else 0.0
-    sev = SEVERITY_PASS if coverage_pct >= 95.0 else SEVERITY_WARN
+    sev = SEVERITY_PASS if coverage_pct >= MIN_COVERAGE_PCT else SEVERITY_WARN
     note = " [expected: bulk load bypassed CDC; only replay events in Parquet]" if coverage_pct < 5 else ""
     record(sev, "consistency.order_id_coverage",
            f"Parquet {parquet_unique:,} / MySQL {mysql_orders:,} ({coverage_pct:.1f}%){note}")
 
     # 3-B. CREATE vs INSERT 수 비교
-    print("\n-- 3-B. CREATE event count --")
+    logging.info("\n-- 3-B. CREATE event count --")
     parquet_creates = len(df[df["op"].isin(["r", "c"])])
     mysql_total = scalar(conn, "SELECT COUNT(*) FROM orders")
     ratio = parquet_creates / mysql_total if mysql_total else 0
@@ -392,7 +412,7 @@ def layer3_consistency(conn) -> None:
            f"Parquet CREATE/READ={parquet_creates:,} vs MySQL rows={mysql_total:,} (ratio={ratio:.2f}){note}")
 
     # 3-C. UPDATE 이벤트 수 sanity check
-    print("\n-- 3-C. UPDATE event count --")
+    logging.info("\n-- 3-C. UPDATE event count --")
     parquet_updates = len(df[df["op"] == "u"])
     record(SEVERITY_INFO, "consistency.update_event_count", f"{parquet_updates:,}")
 
@@ -402,6 +422,12 @@ def layer3_consistency(conn) -> None:
 # ─────────────────────────────────────────────
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        stream=sys.stdout,
+    )
+
     parser = argparse.ArgumentParser(description="Phase 7: Data Quality 3-Layer Check")
     parser.add_argument("--layer", type=int, choices=[1, 2, 3],
                         help="특정 레이어만 실행 (기본: 전체)")
@@ -431,36 +457,36 @@ def main() -> None:
             conn.close()
 
     # 최종 요약
-    print("\n" + "=" * 55)
-    print("[ DQ Summary ]")
-    print("=" * 55)
+    logging.info("\n" + "=" * 55)
+    logging.info("[ DQ Summary ]")
+    logging.info("=" * 55)
     fails  = [f for f in findings if f["severity"] == SEVERITY_FAIL]
     warns  = [f for f in findings if f["severity"] == SEVERITY_WARN]
     passes = [f for f in findings if f["severity"] == SEVERITY_PASS]
 
-    print(f"  PASS : {len(passes)}")
-    print(f"  WARN : {len(warns)}")
-    print(f"  FAIL : {len(fails)}")
+    logging.info("  PASS : %d", len(passes))
+    logging.info("  WARN : %d", len(warns))
+    logging.info("  FAIL : %d", len(fails))
 
     if fails:
-        print("\n[CRITICAL items]")
+        logging.info("\n[CRITICAL items]")
         for f in fails:
-            print(f"  - {f['check']}: {f['detail']}")
+            logging.info("  - %s: %s", f["check"], f["detail"])
 
     if warns:
-        print("\n[WARNING items]")
+        logging.info("\n[WARNING items]")
         for f in warns:
-            print(f"  - {f['check']}: {f['detail']}")
+            logging.info("  - %s: %s", f["check"], f["detail"])
 
-    print()
+    logging.info("")
     if fails:
-        print("[FAIL] DQ check failed -- review CRITICAL items above.")
+        logging.info("[FAIL] DQ check failed -- review CRITICAL items above.")
         sys.exit(1)
     elif warns:
-        print("[WARN] DQ check warnings -- review before proceeding.")
+        logging.info("[WARN] DQ check warnings -- review before proceeding.")
         sys.exit(0)
     else:
-        print("[PASS] DQ check complete -- no issues found.")
+        logging.info("[PASS] DQ check complete -- no issues found.")
         sys.exit(0)
 
 
