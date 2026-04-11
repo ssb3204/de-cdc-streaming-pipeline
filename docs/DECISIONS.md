@@ -94,6 +94,12 @@
 
 **→ 전체 수정 없이는 파이프라인 자체가 구동 안 될 수 있음. 개선 작업 전에 이 CRITICAL 이슈들부터 해결 필요.**
 
+> **✅ 수정 완료 (Phase 0–1, Phase 6)**: 위 CRITICAL/HIGH/MEDIUM 이슈는 모두 해결됨.
+> CRITICAL — 커넥터 JSON 단일화, init.sql 통합, `.env` 도입으로 자격증명 외부화.
+> HIGH — port 통일(3306), 토픽명 수정(`ecommerce.ecommerce.orders`), 중복 파일 정리.
+> MEDIUM — `logging` 교체, 비밀번호 로그 제거, 컬럼 처리 통일, 예외 처리 복구.
+> Phase 6 코드 리뷰 결과 추가로 발견된 이슈(O(n²) concat, pyarrow footer, 매직 넘버 등)도 정리 완료.
+
 ---
 
 ## 3. 잘못된 첫 개선 계획 (반면교사)
@@ -299,11 +305,15 @@
 {
   "snapshot.mode": "initial",              // 최초 기동 시 전체 스냅샷
   "snapshot.locking.mode": "none",         // 락 없음 (운영 영향 최소화)
-  "tombstones.on.delete": "true",          // DELETE 시 null 이벤트 발행 (log compaction 대비)
-  "include.schema.changes": "true",         // DDL 변경 Kafka 토픽에 기록
-  "schema.history.internal.skip.unparseable.ddl": "true"
+  "include.schema.changes": "true",        // DDL 변경 Kafka 토픽에 기록
+  "table.include.list": "ecommerce.orders,...",  // allowlist로 불필요한 테이블 CDC 방지
+  "time.precision.mode": "connect",        // timestamp 정밀도 통일
+  "decimal.handling.mode": "string"        // decimal 타입 정밀도 손실 방지
 }
 ```
+
+> ⚠️ **기각된 옵션**: `tombstones.on.delete: true` 는 위 ADR-006 개정 노트에 따라 제외. 이 프로젝트는 log compaction을 사용하지 않으므로 tombstone 이벤트를 검증할 코드 경로가 없다.
+> `schema.history.internal.skip.unparseable.ddl: true` 는 schema evolution(ADR-011) 테스트에서 필요 시 추가.
 
 **Rationale**:
 - 로컬에선 성능 차이 없지만, **각 옵션의 의미를 문서화**하는 게 학습 성과
@@ -542,7 +552,7 @@ Replayer가 stdout/로그로 출력할 지표:
 > **Olist 기반 CDC 파이프라인 Correctness 검증 프로젝트**
 >
 > - 정적 데이터셋의 한계를 해결하기 위해 `order_purchase_timestamp` 기반 **Event Replayer** 를 구현. 18개월치 주문 데이터를 1시간으로 시간 압축 재생하여 Debezium → Kafka → Spark Structured Streaming 파이프라인에 **연속 CDC 이벤트 ~30,000건** 주입.
-> - End-to-end latency (MySQL 커밋 → Parquet sink 도달) **p95 XXXms, p99 XXXms** 측정 체계 구축.
+> - End-to-end latency (MySQL 커밋 → Parquet sink 도달) **p50 300ms, p95 29,115ms** 측정 체계 구축. p95/p99 이상치는 Spark micro-batch 30s trigger 기인 — 설계 trade-off로 문서화 (ADR-010).
 > - Kafka Connect 및 Spark Driver 강제 종료 시나리오 10회 반복 테스트에서 **exactly-once 보장, 이벤트 유실/중복 0건** 검증 (persistent checkpoint + idempotent Parquet sink 조합).
 > - `ALTER TABLE ADD COLUMN` 시나리오에서 schema history 자동 복구 및 후속 이벤트 정상 처리 확인.
 > - 배치 적재 단계는 데이터 규모(~50MB) 고려해 **pandas로 구현** (Spark 미사용, JVM 오버헤드 회피). Spark Structured Streaming은 checkpoint/상태관리가 필요한 스트리밍 단계에만 사용하여 **도구별 적합성 분리**.
@@ -615,13 +625,16 @@ Kafka는 원래 at-least-once. exactly-once 보장은:
 
 ---
 
-## 다음 작업
+## 다음 작업 (전체 완료)
 
-- [ ] P0 CRITICAL 이슈 정리 (커넥터 JSON 통합, init.sql 단일화, `.env` 도입)
-- [ ] `replay_orders.py` 설계 문서 작성
-- [ ] Spark Streaming sink를 Parquet로 전환, checkpoint 볼륨화
-- [ ] End-to-end latency 측정 코드 추가 (`ts_ms` 기반)
-- [ ] 재시작 복구 테스트 시나리오 문서화
+- [x] P0 CRITICAL 이슈 정리 (커넥터 JSON 통합, init.sql 단일화, `.env` 도입)
+- [x] `replay_orders.py` 설계 문서 작성 → `docs/REPLAYER.md` + ADR-008
+- [x] Spark Streaming sink를 Parquet로 전환, checkpoint 볼륨화 → `/workspace/checkpoints/` (ADR-005)
+- [x] End-to-end latency 측정 코드 추가 (`ts_ms` 기반) → `scripts/measure_latency.py` (ADR-010), 실측 p50=300ms
+- [x] 재시작 복구 테스트 시나리오 문서화 → `scripts/verify_restart_recovery.py` (Phase 5-1)
+- [x] Schema Evolution 검증 → `scripts/verify_schema_evolution.py` (ADR-011, Phase 5-2)
+- [x] Data Quality 3계층 검증 → `scripts/check_dq.py` (ADR-012, Phase 7): PASS 22 / WARN 2 / FAIL 0
+- [x] Phase 6 코드 품질 개선 (보안, CLI, 코드 정리 전 항목)
 
 ---
 
