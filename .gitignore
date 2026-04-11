@@ -24,6 +24,13 @@ data/cdc_output/
 *.parquet
 spark-warehouse/
 
+# Spark-split 데이터 (용량 큰 CSV — 직접 다운로드 필요, README 참조)
+spark-submit/data/*.csv
+spark-submit/data/orders_initial_70/
+spark-submit/data/orders_future_30/
+spark-submit/data/order_items_initial_70/
+spark-submit/data/order_items_future_30/
+
 # Garbage collection log (Claude Code 자동 기록, 커밋 불필요)
 .claude/garbage-collection.md
 
