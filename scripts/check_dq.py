@@ -1,0 +1,455 @@
+"""
+check_dq.py — Phase 7: Data Quality 3-Layer Check
+
+Layer 1 (MySQL Source):
+  - PK null / 중복 체크
+  - FK 무결성 체크
+  - Row count (CSV 원본 대비)
+  - 핵심 컬럼 null 비율
+
+Layer 2 (Parquet CDC):
+  - 이벤트 op 분포
+  - order_id 중복 이벤트 (dedup 관점)
+  - 스키마 컬럼 존재 여부
+
+Layer 3 (Consistency):
+  - MySQL orders row count vs Parquet 이벤트 수 비교
+
+사용법:
+  python scripts/check_dq.py            # 전체 실행
+  python scripts/check_dq.py --layer 1  # Layer 1만
+  python scripts/check_dq.py --layer 2  # Layer 2만
+  python scripts/check_dq.py --layer 3  # Layer 3만
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    _ROOT = Path(__file__).parent.parent
+    load_dotenv(_ROOT / ".env")
+except ImportError:
+    pass
+
+# ─────────────────────────────────────────────
+# 설정
+# ─────────────────────────────────────────────
+
+DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.environ.get("DB_PORT", "3306"))
+DB_NAME = os.environ.get("MYSQL_DATABASE", "ecommerce")
+DB_USER = os.environ.get("MYSQL_USER", "appuser")
+DB_PASS = os.environ.get("MYSQL_PASSWORD", "apppass")
+
+PARQUET_BASE = Path(__file__).parent.parent / "data" / "cdc_output"
+ORDERS_PARQUET = PARQUET_BASE / "topic=ecommerce.ecommerce.orders"
+
+# CSV 원본 row 수 (spark split 전 olist 전체 기준)
+EXPECTED_ROWS = {
+    "orders": 99441,
+    "customers": 99441,
+    "order_items": 112650,
+    "products": 32951,
+}
+
+# 핵심 null 체크 컬럼 (컬럼명: 허용 null 비율 %)
+NULL_THRESHOLDS: dict[str, float] = {
+    "orders.order_purchase_timestamp": 5.0,   # CRITICAL: 현재 99.9%
+    "orders.order_status": 1.0,
+    "orders.customer_id": 0.0,
+    "order_items.order_id": 0.0,
+    "order_items.product_id": 0.0,
+    "order_items.price": 1.0,
+}
+
+SEVERITY_PASS  = "[PASS]"
+SEVERITY_WARN  = "[WARN]"
+SEVERITY_FAIL  = "[FAIL]"
+SEVERITY_SKIP  = "[SKIP]"
+SEVERITY_INFO  = "[INFO]"
+
+findings: list[dict] = []
+
+
+def record(severity: str, check: str, detail: str) -> None:
+    findings.append({"severity": severity, "check": check, "detail": detail})
+    tag = {
+        SEVERITY_FAIL: "CRITICAL",
+        SEVERITY_WARN: "HIGH",
+        SEVERITY_PASS: "OK",
+        SEVERITY_SKIP: "SKIP",
+        SEVERITY_INFO: "INFO",
+    }.get(severity, "?")
+    print(f"  {severity} [{tag}] {check}: {detail}")
+
+
+# ─────────────────────────────────────────────
+# DB 연결
+# ─────────────────────────────────────────────
+
+def get_connection():
+    try:
+        import pymysql
+    except ImportError:
+        print("[ERROR] pymysql not installed -- pip install pymysql")
+        sys.exit(1)
+
+    return pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def query(conn, sql: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return cur.fetchall()
+
+
+def scalar(conn, sql: str):
+    rows = query(conn, sql)
+    if rows:
+        return list(rows[0].values())[0]
+    return None
+
+
+# ─────────────────────────────────────────────
+# Layer 1: MySQL Source DQ
+# ─────────────────────────────────────────────
+
+def layer1_mysql(conn) -> None:
+    print("\n" + "=" * 55)
+    print("[ Layer 1: MySQL Source DQ ]")
+    print("=" * 55)
+
+    # 1-A. Row count (vs CSV 원본의 70%)
+    print("\n-- 1-A. Row count --")
+    tables = ["orders", "customers", "order_items", "products"]
+    for tbl in tables:
+        cnt = scalar(conn, f"SELECT COUNT(*) FROM {tbl}")
+        expected_full = EXPECTED_ROWS[tbl]
+        expected_70 = int(expected_full * 0.7)
+        # orders/order_items는 70% 적재; customers/products는 전체 적재
+        expected = expected_70 if tbl in ("orders", "order_items") else expected_full
+        diff = abs(cnt - expected)
+        tol = max(int(expected * 0.02), 10)  # 2% 허용
+        sev = SEVERITY_PASS if diff <= tol else SEVERITY_WARN
+        record(sev, f"{tbl}.row_count",
+               f"{cnt:,} (expected ~{expected:,}, diff={diff:,})")
+
+    # 1-B. PK null / 중복
+    print("\n-- 1-B. PK null / duplicate --")
+    pk_map = {
+        "orders": "order_id",
+        "customers": "customer_id",
+        "products": "product_id",
+    }
+    for tbl, pk in pk_map.items():
+        null_cnt = scalar(conn, f"SELECT COUNT(*) FROM {tbl} WHERE {pk} IS NULL")
+        dup_cnt = scalar(conn,
+            f"SELECT COUNT(*) FROM (SELECT {pk} FROM {tbl} GROUP BY {pk} HAVING COUNT(*) > 1) t")
+        sev_null = SEVERITY_PASS if null_cnt == 0 else SEVERITY_FAIL
+        sev_dup  = SEVERITY_PASS if dup_cnt == 0 else SEVERITY_FAIL
+        record(sev_null, f"{tbl}.{pk}_null", f"{null_cnt}")
+        record(sev_dup,  f"{tbl}.{pk}_duplicate", f"{dup_cnt}")
+
+    # order_items는 복합PK (order_id + order_item_id)
+    dup_items = scalar(conn,
+        "SELECT COUNT(*) FROM ("
+        "  SELECT order_id, order_item_id FROM order_items"
+        "  GROUP BY order_id, order_item_id HAVING COUNT(*) > 1"
+        ") t")
+    record(
+        SEVERITY_PASS if dup_items == 0 else SEVERITY_FAIL,
+        "order_items.composite_pk_duplicate", f"{dup_items}"
+    )
+
+    # 1-C. FK 무결성
+    print("\n-- 1-C. FK integrity --")
+    orphan_orders = scalar(conn,
+        "SELECT COUNT(*) FROM orders o"
+        "  LEFT JOIN customers c ON o.customer_id = c.customer_id"
+        "  WHERE c.customer_id IS NULL")
+    orphan_items = scalar(conn,
+        "SELECT COUNT(*) FROM order_items oi"
+        "  LEFT JOIN orders o ON oi.order_id = o.order_id"
+        "  WHERE o.order_id IS NULL")
+    record(
+        SEVERITY_PASS if orphan_orders == 0 else SEVERITY_FAIL,
+        "orders.customer_id FK orphan", f"{orphan_orders}"
+    )
+    record(
+        SEVERITY_PASS if orphan_items == 0 else SEVERITY_FAIL,
+        "order_items.order_id FK orphan", f"{orphan_items}"
+    )
+
+    # 1-D. 핵심 컬럼 null 비율
+    print("\n-- 1-D. Critical null rates --")
+    null_checks = [
+        ("orders", "order_purchase_timestamp", 5.0),
+        ("orders", "order_status", 1.0),
+        ("orders", "customer_id", 0.0),
+        ("order_items", "order_id", 0.0),
+        ("order_items", "product_id", 0.0),
+        ("order_items", "price", 1.0),
+    ]
+    for tbl, col, threshold in null_checks:
+        total = scalar(conn, f"SELECT COUNT(*) FROM {tbl}")
+        null_cnt = scalar(conn, f"SELECT COUNT(*) FROM {tbl} WHERE {col} IS NULL")
+        pct = (null_cnt / total * 100) if total else 0.0
+        sev = SEVERITY_PASS if pct <= threshold else SEVERITY_FAIL
+        note = ""
+        if tbl == "orders" and col == "order_purchase_timestamp" and pct > 5:
+            note = " [known issue: UTC-aware datetime -> MySQL DATETIME incompatibility in load_data.py]"
+        record(sev, f"{tbl}.{col}_null_rate",
+               f"{pct:.1f}% ({null_cnt:,}/{total:,}){note}")
+
+
+# ─────────────────────────────────────────────
+# Layer 2: Parquet CDC DQ
+# ─────────────────────────────────────────────
+
+def layer2_parquet() -> None:
+    print("\n" + "=" * 55)
+    print("[ Layer 2: Parquet CDC DQ ]")
+    print("=" * 55)
+
+    try:
+        import pandas as pd
+    except ImportError:
+        print("[SKIP] pandas/pyarrow not installed")
+        return
+
+    if not ORDERS_PARQUET.exists():
+        record(SEVERITY_SKIP, "parquet.orders", f"path not found: {ORDERS_PARQUET}")
+        return
+
+    parquet_files = list(ORDERS_PARQUET.rglob("*.parquet"))
+    if not parquet_files:
+        record(SEVERITY_SKIP, "parquet.orders", "no parquet files found")
+        return
+
+    df = pd.read_parquet(ORDERS_PARQUET)
+    total = len(df)
+    record(SEVERITY_INFO, "parquet.total_events", f"{total:,}")
+
+    # 2-A. op 분포
+    print("\n-- 2-A. op distribution --")
+    op_counts = df["op"].value_counts().to_dict()
+    for op, cnt in sorted(op_counts.items()):
+        label = {"r": "READ(snapshot)", "c": "CREATE", "u": "UPDATE", "d": "DELETE"}.get(op, op)
+        record(SEVERITY_INFO, f"parquet.op={op}", f"{cnt:,} ({label})")
+
+    # 2-B. order_id 필드 존재 + null 체크
+    print("\n-- 2-B. Required field null check --")
+
+    def count_null_in_after(df: "pd.DataFrame", field: str) -> int:
+        count = 0
+        for val in df["after"]:
+            if val is None:
+                count += 1
+                continue
+            try:
+                parsed = json.loads(val)
+                if parsed.get(field) is None:
+                    count += 1
+            except Exception:
+                count += 1
+        return count
+
+    insert_rows = df[df["op"].isin(["r", "c"])].copy()
+    if not insert_rows.empty:
+        null_order_id = count_null_in_after(insert_rows, "order_id")
+        pct = null_order_id / len(insert_rows) * 100
+        record(
+            SEVERITY_PASS if null_order_id == 0 else SEVERITY_FAIL,
+            "parquet.after.order_id_null",
+            f"{null_order_id} ({pct:.1f}%)"
+        )
+
+    # 2-C. 스키마 컬럼 검증 (is_late_delivery)
+    print("\n-- 2-C. Schema evolution column check --")
+    update_rows = df[df["op"] == "u"].copy()
+    if update_rows.empty:
+        record(SEVERITY_SKIP, "parquet.is_late_delivery", "no UPDATE events found")
+    else:
+        has_col = 0
+        for val in update_rows["after"]:
+            try:
+                parsed = json.loads(val) if val else {}
+                if "is_late_delivery" in parsed:
+                    has_col += 1
+            except Exception:
+                pass
+        sev = SEVERITY_PASS if has_col > 0 else SEVERITY_WARN
+        record(sev, "parquet.is_late_delivery",
+               f"UPDATE {len(update_rows)} events, {has_col} contain is_late_delivery")
+
+    # 2-D. after 필드 파싱 실패율
+    print("\n-- 2-D. after parse failure rate --")
+    parse_fail = 0
+    for val in df["after"]:
+        if val is None:
+            continue
+        try:
+            json.loads(val)
+        except Exception:
+            parse_fail += 1
+    pct = parse_fail / total * 100 if total else 0
+    record(
+        SEVERITY_PASS if parse_fail == 0 else SEVERITY_WARN,
+        "parquet.after_parse_fail",
+        f"{parse_fail} ({pct:.2f}%)"
+    )
+
+
+# ─────────────────────────────────────────────
+# Layer 3: MySQL vs Parquet Consistency
+# ─────────────────────────────────────────────
+
+def layer3_consistency(conn) -> None:
+    print("\n" + "=" * 55)
+    print("[ Layer 3: MySQL vs Parquet Consistency ]")
+    print("=" * 55)
+
+    try:
+        import pandas as pd
+    except ImportError:
+        record(SEVERITY_SKIP, "consistency", "pandas/pyarrow not installed")
+        return
+
+    if not ORDERS_PARQUET.exists():
+        record(SEVERITY_SKIP, "consistency.orders", f"parquet path not found: {ORDERS_PARQUET}")
+        return
+
+    parquet_files = list(ORDERS_PARQUET.rglob("*.parquet"))
+    if not parquet_files:
+        record(SEVERITY_SKIP, "consistency.orders", "no parquet files found")
+        return
+
+    df = pd.read_parquet(ORDERS_PARQUET)
+
+    # 3-A. MySQL orders 수 vs Parquet 비 중복 order_id 수
+    print("\n-- 3-A. Unique order coverage --")
+    mysql_orders = scalar(conn, "SELECT COUNT(DISTINCT order_id) FROM orders")
+
+    # Parquet에서 order_id 추출 (after 또는 before JSON에서)
+    parquet_order_ids: set[str] = set()
+    for _, row in df.iterrows():
+        for field in ["after", "before"]:
+            val = row.get(field)
+            if val is None:
+                continue
+            try:
+                parsed = json.loads(val)
+                oid = parsed.get("order_id")
+                if oid:
+                    parquet_order_ids.add(oid)
+            except Exception:
+                pass
+
+    parquet_unique = len(parquet_order_ids)
+    overlap = parquet_unique  # Parquet에 있는 order_id는 CDC로 추적된 것
+
+    # 비율: CDC가 MySQL 전체를 얼마나 커버하는가
+    # Note: initial bulk load (69,608 rows) bypassed CDC and went directly to MySQL.
+    # Only events from replay_orders.py (~129) are in Parquet. Low coverage is expected.
+    coverage_pct = (overlap / mysql_orders * 100) if mysql_orders else 0.0
+    sev = SEVERITY_PASS if coverage_pct >= 95.0 else SEVERITY_WARN
+    note = " [expected: bulk load bypassed CDC; only replay events in Parquet]" if coverage_pct < 5 else ""
+    record(sev, "consistency.order_id_coverage",
+           f"Parquet {parquet_unique:,} / MySQL {mysql_orders:,} ({coverage_pct:.1f}%){note}")
+
+    # 3-B. CREATE vs INSERT 수 비교
+    print("\n-- 3-B. CREATE event count --")
+    parquet_creates = len(df[df["op"].isin(["r", "c"])])
+    mysql_total = scalar(conn, "SELECT COUNT(*) FROM orders")
+    ratio = parquet_creates / mysql_total if mysql_total else 0
+    sev = SEVERITY_PASS if 0.95 <= ratio <= 1.10 else SEVERITY_WARN
+    note = " [expected: only replay events captured; bulk load not in CDC]" if ratio < 0.1 else ""
+    record(sev, "consistency.create_vs_mysql",
+           f"Parquet CREATE/READ={parquet_creates:,} vs MySQL rows={mysql_total:,} (ratio={ratio:.2f}){note}")
+
+    # 3-C. UPDATE 이벤트 수 sanity check
+    print("\n-- 3-C. UPDATE event count --")
+    parquet_updates = len(df[df["op"] == "u"])
+    record(SEVERITY_INFO, "consistency.update_event_count", f"{parquet_updates:,}")
+
+
+# ─────────────────────────────────────────────
+# main
+# ─────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Phase 7: Data Quality 3-Layer Check")
+    parser.add_argument("--layer", type=int, choices=[1, 2, 3],
+                        help="특정 레이어만 실행 (기본: 전체)")
+    args = parser.parse_args()
+
+    run_all = args.layer is None
+    run_l1 = run_all or args.layer == 1
+    run_l2 = run_all or args.layer == 2
+    run_l3 = run_all or args.layer == 3
+
+    conn = None
+    if run_l1 or run_l3:
+        conn = get_connection()
+
+    try:
+        if run_l1:
+            layer1_mysql(conn)
+
+        if run_l2:
+            layer2_parquet()
+
+        if run_l3:
+            layer3_consistency(conn)
+
+    finally:
+        if conn:
+            conn.close()
+
+    # 최종 요약
+    print("\n" + "=" * 55)
+    print("[ DQ Summary ]")
+    print("=" * 55)
+    fails  = [f for f in findings if f["severity"] == SEVERITY_FAIL]
+    warns  = [f for f in findings if f["severity"] == SEVERITY_WARN]
+    passes = [f for f in findings if f["severity"] == SEVERITY_PASS]
+
+    print(f"  PASS : {len(passes)}")
+    print(f"  WARN : {len(warns)}")
+    print(f"  FAIL : {len(fails)}")
+
+    if fails:
+        print("\n[CRITICAL items]")
+        for f in fails:
+            print(f"  - {f['check']}: {f['detail']}")
+
+    if warns:
+        print("\n[WARNING items]")
+        for f in warns:
+            print(f"  - {f['check']}: {f['detail']}")
+
+    print()
+    if fails:
+        print("[FAIL] DQ check failed -- review CRITICAL items above.")
+        sys.exit(1)
+    elif warns:
+        print("[WARN] DQ check warnings -- review before proceeding.")
+        sys.exit(0)
+    else:
+        print("[PASS] DQ check complete -- no issues found.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

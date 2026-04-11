@@ -51,6 +51,15 @@ def load_table(csv_filename: str, table_name: str, parse_dates=None, chunksize: 
     total_rows = 0
 
     for chunk in pd.read_csv(csv_path, chunksize=chunksize, parse_dates=parse_dates):
+        # Strip timezone info from datetime columns before MySQL insert.
+        # parse_dates parses ISO 8601 "Z" suffix as UTC-aware Timestamp,
+        # which pymysql drops silently when writing to DATETIME (no tz support).
+        if parse_dates:
+            for col in parse_dates:
+                if col in chunk.columns and hasattr(chunk[col], "dt"):
+                    chunk[col] = chunk[col].dt.tz_localize(None) if chunk[col].dt.tz is None \
+                        else chunk[col].dt.tz_convert(None)
+
         # 여기부터 추가
         if table_name == "products":
             chunk = chunk.rename(columns={
