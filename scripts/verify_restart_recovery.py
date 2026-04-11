@@ -49,13 +49,15 @@ SNAPSHOT_FILE = Path(__file__).parent / ".restart_snapshot.json"
 # ---------------------------------------------------------------------------
 
 def count_parquet_rows() -> dict[str, int]:
-    """토픽별 Parquet 파일 행 수 집계"""
+    """토픽별 Parquet 파일 행 수 집계 (footer metadata만 읽어 메모리 효율적)"""
+    import pyarrow.parquet as pq
+
     counts: dict[str, int] = {}
     for topic_dir in sorted(DATA_DIR.glob("topic=*")):
         topic = topic_dir.name.replace("topic=", "")
         files = list(topic_dir.glob("*.parquet"))
         if files:
-            counts[topic] = sum(len(pd.read_parquet(f)) for f in files)
+            counts[topic] = sum(pq.read_metadata(f).num_rows for f in files)
     return counts
 
 
@@ -117,9 +119,10 @@ def do_inject(n: int) -> None:
     with engine.begin() as conn:
         result = conn.execute(
             text(
-                f"UPDATE orders SET order_status='delivered' "
-                f"WHERE order_status='shipped' LIMIT {n}"
-            )
+                "UPDATE orders SET order_status='delivered' "
+                "WHERE order_status='shipped' LIMIT :n"
+            ),
+            {"n": n},
         )
         affected = result.rowcount
 
@@ -130,9 +133,10 @@ def do_inject(n: int) -> None:
         with engine.begin() as conn:
             result = conn.execute(
                 text(
-                    f"UPDATE orders SET order_status='delivered' "
-                    f"WHERE order_status='processing' LIMIT {n}"
-                )
+                    "UPDATE orders SET order_status='delivered' "
+                    "WHERE order_status='processing' LIMIT :n"
+                ),
+                {"n": n},
             )
             affected = result.rowcount
         print(f"  (shipped 소진, processing → delivered로 fallback): {affected}건")

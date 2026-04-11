@@ -232,9 +232,6 @@ def _to_mysql_dt(val) -> Optional[str]:
 
 
 def run_replay(df: pd.DataFrame, ratio: float, cfg: ReplayConfig) -> None:
-    conn = make_connection()
-    cursor = conn.cursor()
-
     inserted = 0
     skipped = 0
     updates_sent = 0
@@ -246,89 +243,94 @@ def run_replay(df: pd.DataFrame, ratio: float, cfg: ReplayConfig) -> None:
 
     logging.info("INSERT 루프 시작: %d건, 계획 %.1f분", len(df), planned_seconds / 60)
 
-    prev_ts = ts_col.iloc[0]
+    conn = make_connection()
+    try:
+        cursor = conn.cursor()
+        try:
+            prev_ts = ts_col.iloc[0]
 
-    for i, row in enumerate(df.itertuples(index=False), start=1):
-        cur_ts = row.order_purchase_timestamp
+            for i, row in enumerate(df.itertuples(index=False), start=1):
+                cur_ts = row.order_purchase_timestamp
 
-        # 이벤트 간 시간 간격만큼 sleep (압축 비율 적용)
-        gap = (cur_ts - prev_ts).total_seconds() / ratio
-        if gap > 0:
-            # 대기 중인 UPDATE 먼저 발행
-            now = time.monotonic()
-            fired = []
-            for upd in pending_updates:
-                fire_at, oid, ddate = upd
-                if now >= fire_at:
+                # 이벤트 간 시간 간격만큼 sleep (압축 비율 적용)
+                gap = (cur_ts - prev_ts).total_seconds() / ratio
+                if gap > 0:
+                    # 대기 중인 UPDATE 먼저 발행 (O(n) — list comprehension)
+                    now = time.monotonic()
+                    remaining: list[tuple[float, str, Optional[str]]] = []
+                    for upd in pending_updates:
+                        fire_at, oid, ddate = upd
+                        if now >= fire_at:
+                            try:
+                                cursor.execute(_UPDATE_SQL, (_STATUS_DELIVERED, ddate, oid))
+                                updates_sent += 1
+                                logging.debug("UPDATE sent: %s -> delivered", oid)
+                            except Exception as e:
+                                logging.warning("UPDATE 실패 %s: %s", oid, e)
+                        else:
+                            remaining.append(upd)
+                    pending_updates = remaining
+
+                    time.sleep(gap)
+
+                prev_ts = cur_ts
+
+                # INSERT 상태 결정 (UPDATE 주입 활성화 시 일부는 invoiced로 시작)
+                inject_update = (
+                    cfg.include_updates
+                    and row.order_status == _STATUS_DELIVERED
+                    and random.random() < cfg.update_ratio
+                )
+                insert_status = _STATUS_INITIAL if inject_update else row.order_status
+                delivered_date = _to_mysql_dt(getattr(row, "order_delivered_customer_date", None))
+
+                try:
+                    affected = cursor.execute(
+                        _INSERT_SQL,
+                        (
+                            row.order_id,
+                            row.customer_id,
+                            insert_status,
+                            _to_mysql_dt(row.order_purchase_timestamp),
+                            _to_mysql_dt(getattr(row, "order_approved_at", None)),
+                            _to_mysql_dt(getattr(row, "order_delivered_carrier_date", None)),
+                            delivered_date,
+                            _to_mysql_dt(getattr(row, "order_estimated_delivery_date", None)),
+                        ),
+                    )
+                    if affected == 1:
+                        inserted += 1
+                        if inject_update:
+                            delay = random.uniform(cfg.update_delay_min, cfg.update_delay_max)
+                            pending_updates.append((time.monotonic() + delay, row.order_id, delivered_date))
+                    else:
+                        skipped += 1
+                        logging.warning("SKIP (중복 PK): %s", row.order_id)
+                except pymysql.err.IntegrityError as e:
+                    skipped += 1
+                    logging.warning("SKIP (FK/제약 위반) %s: %s", row.order_id, e)
+
+                if i % 500 == 0 or i == len(df):
+                    elapsed = time.monotonic() - start_wall
+                    logging.info(
+                        "[%d/%d] inserted=%d skipped=%d updates=%d elapsed=%.0fs",
+                        i, len(df), inserted, skipped, updates_sent, elapsed,
+                    )
+
+            # 루프 종료 후 잔여 UPDATE 발행
+            if pending_updates:
+                logging.info("잔여 UPDATE %d건 발행 중...", len(pending_updates))
+                for _, oid, ddate in pending_updates:
                     try:
                         cursor.execute(_UPDATE_SQL, (_STATUS_DELIVERED, ddate, oid))
                         updates_sent += 1
-                        logging.debug("UPDATE sent: %s -> delivered", oid)
                     except Exception as e:
                         logging.warning("UPDATE 실패 %s: %s", oid, e)
-                    fired.append(upd)
-            for f in fired:
-                pending_updates.remove(f)
 
-            time.sleep(gap)
-
-        prev_ts = cur_ts
-
-        # INSERT 상태 결정 (UPDATE 주입 활성화 시 일부는 invoiced로 시작)
-        inject_update = (
-            cfg.include_updates
-            and row.order_status == _STATUS_DELIVERED
-            and random.random() < cfg.update_ratio
-        )
-        insert_status = _STATUS_INITIAL if inject_update else row.order_status
-        delivered_date = _to_mysql_dt(getattr(row, "order_delivered_customer_date", None))
-
-        try:
-            affected = cursor.execute(
-                _INSERT_SQL,
-                (
-                    row.order_id,
-                    row.customer_id,
-                    insert_status,
-                    _to_mysql_dt(row.order_purchase_timestamp),
-                    _to_mysql_dt(getattr(row, "order_approved_at", None)),
-                    _to_mysql_dt(getattr(row, "order_delivered_carrier_date", None)),
-                    delivered_date,
-                    _to_mysql_dt(getattr(row, "order_estimated_delivery_date", None)),
-                ),
-            )
-            if affected == 1:
-                inserted += 1
-                # UPDATE 예약
-                if inject_update:
-                    delay = random.uniform(cfg.update_delay_min, cfg.update_delay_max)
-                    pending_updates.append((time.monotonic() + delay, row.order_id, delivered_date))
-            else:
-                skipped += 1
-                logging.warning("SKIP (중복 PK): %s", row.order_id)
-        except pymysql.err.IntegrityError as e:
-            skipped += 1
-            logging.warning("SKIP (FK/제약 위반) %s: %s", row.order_id, e)
-
-        if i % 500 == 0 or i == len(df):
-            elapsed = time.monotonic() - start_wall
-            logging.info(
-                "[%d/%d] inserted=%d skipped=%d updates=%d elapsed=%.0fs",
-                i, len(df), inserted, skipped, updates_sent, elapsed,
-            )
-
-    # 루프 종료 후 잔여 UPDATE 발행
-    if pending_updates:
-        logging.info("잔여 UPDATE %d건 발행 중...", len(pending_updates))
-        for _, oid, ddate in pending_updates:
-            try:
-                cursor.execute(_UPDATE_SQL, (_STATUS_DELIVERED, ddate, oid))
-                updates_sent += 1
-            except Exception as e:
-                logging.warning("UPDATE 실패 %s: %s", oid, e)
-
-    cursor.close()
-    conn.close()
+        finally:
+            cursor.close()
+    finally:
+        conn.close()
 
     elapsed = time.monotonic() - start_wall
     drift_pct = (elapsed - planned_seconds) / planned_seconds * 100 if planned_seconds > 0 else 0

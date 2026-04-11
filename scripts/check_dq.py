@@ -58,7 +58,7 @@ EXPECTED_ROWS = {
 
 # 핵심 null 체크 컬럼 (컬럼명: 허용 null 비율 %)
 NULL_THRESHOLDS: dict[str, float] = {
-    "orders.order_purchase_timestamp": 5.0,   # CRITICAL: 현재 99.9%
+    "orders.order_purchase_timestamp": 5.0,
     "orders.order_status": 1.0,
     "orders.customer_id": 0.0,
     "order_items.order_id": 0.0,
@@ -73,6 +73,22 @@ SEVERITY_SKIP  = "[SKIP]"
 SEVERITY_INFO  = "[INFO]"
 
 findings: list[dict] = []
+
+# SQL identifier allowlist — 테이블/컬럼명 f-string 삽입 전 반드시 통과
+_ALLOWED_IDENTIFIERS: frozenset[str] = frozenset({
+    # tables
+    "orders", "customers", "order_items", "products",
+    # columns
+    "order_id", "customer_id", "product_id", "order_item_id",
+    "order_purchase_timestamp", "order_status", "price",
+})
+
+
+def _safe(name: str) -> str:
+    """SQL identifier allowlist 검증 — 허용 목록에 없으면 즉시 예외."""
+    if name not in _ALLOWED_IDENTIFIERS:
+        raise ValueError(f"Disallowed SQL identifier: {name!r}")
+    return name
 
 
 def record(severity: str, check: str, detail: str) -> None:
@@ -134,10 +150,9 @@ def layer1_mysql(conn) -> None:
     print("\n-- 1-A. Row count --")
     tables = ["orders", "customers", "order_items", "products"]
     for tbl in tables:
-        cnt = scalar(conn, f"SELECT COUNT(*) FROM {tbl}")
+        cnt = scalar(conn, f"SELECT COUNT(*) FROM {_safe(tbl)}")
         expected_full = EXPECTED_ROWS[tbl]
         expected_70 = int(expected_full * 0.7)
-        # orders/order_items는 70% 적재; customers/products는 전체 적재
         expected = expected_70 if tbl in ("orders", "order_items") else expected_full
         diff = abs(cnt - expected)
         tol = max(int(expected * 0.02), 10)  # 2% 허용
@@ -153,9 +168,11 @@ def layer1_mysql(conn) -> None:
         "products": "product_id",
     }
     for tbl, pk in pk_map.items():
-        null_cnt = scalar(conn, f"SELECT COUNT(*) FROM {tbl} WHERE {pk} IS NULL")
+        null_cnt = scalar(conn,
+            f"SELECT COUNT(*) FROM {_safe(tbl)} WHERE {_safe(pk)} IS NULL")
         dup_cnt = scalar(conn,
-            f"SELECT COUNT(*) FROM (SELECT {pk} FROM {tbl} GROUP BY {pk} HAVING COUNT(*) > 1) t")
+            f"SELECT COUNT(*) FROM "
+            f"(SELECT {_safe(pk)} FROM {_safe(tbl)} GROUP BY {_safe(pk)} HAVING COUNT(*) > 1) t")
         sev_null = SEVERITY_PASS if null_cnt == 0 else SEVERITY_FAIL
         sev_dup  = SEVERITY_PASS if dup_cnt == 0 else SEVERITY_FAIL
         record(sev_null, f"{tbl}.{pk}_null", f"{null_cnt}")
@@ -202,8 +219,9 @@ def layer1_mysql(conn) -> None:
         ("order_items", "price", 1.0),
     ]
     for tbl, col, threshold in null_checks:
-        total = scalar(conn, f"SELECT COUNT(*) FROM {tbl}")
-        null_cnt = scalar(conn, f"SELECT COUNT(*) FROM {tbl} WHERE {col} IS NULL")
+        total = scalar(conn, f"SELECT COUNT(*) FROM {_safe(tbl)}")
+        null_cnt = scalar(conn,
+            f"SELECT COUNT(*) FROM {_safe(tbl)} WHERE {_safe(col)} IS NULL")
         pct = (null_cnt / total * 100) if total else 0.0
         sev = SEVERITY_PASS if pct <= threshold else SEVERITY_FAIL
         note = ""
@@ -216,6 +234,35 @@ def layer1_mysql(conn) -> None:
 # ─────────────────────────────────────────────
 # Layer 2: Parquet CDC DQ
 # ─────────────────────────────────────────────
+
+def _parse_json_field(val, field: str):
+    """after/before JSON 문자열에서 특정 필드 값 추출. 파싱 실패 시 None 반환."""
+    if val is None:
+        return None
+    try:
+        return json.loads(val).get(field)
+    except Exception:
+        return None
+
+
+def _json_parse_ok(val) -> bool:
+    """after JSON 파싱 성공 여부. None은 파싱 대상이 아니므로 True."""
+    if val is None:
+        return True
+    try:
+        json.loads(val)
+        return True
+    except Exception:
+        return False
+
+
+def _has_field_in_json(val, field: str) -> bool:
+    """JSON 문자열에 특정 필드가 존재하는지 확인."""
+    try:
+        return field in json.loads(val) if val else False
+    except Exception:
+        return False
+
 
 def layer2_parquet() -> None:
     print("\n" + "=" * 55)
@@ -250,24 +297,11 @@ def layer2_parquet() -> None:
 
     # 2-B. order_id 필드 존재 + null 체크
     print("\n-- 2-B. Required field null check --")
-
-    def count_null_in_after(df: "pd.DataFrame", field: str) -> int:
-        count = 0
-        for val in df["after"]:
-            if val is None:
-                count += 1
-                continue
-            try:
-                parsed = json.loads(val)
-                if parsed.get(field) is None:
-                    count += 1
-            except Exception:
-                count += 1
-        return count
-
     insert_rows = df[df["op"].isin(["r", "c"])].copy()
     if not insert_rows.empty:
-        null_order_id = count_null_in_after(insert_rows, "order_id")
+        null_order_id = insert_rows["after"].map(
+            lambda v: _parse_json_field(v, "order_id")
+        ).isna().sum()
         pct = null_order_id / len(insert_rows) * 100
         record(
             SEVERITY_PASS if null_order_id == 0 else SEVERITY_FAIL,
@@ -281,28 +315,16 @@ def layer2_parquet() -> None:
     if update_rows.empty:
         record(SEVERITY_SKIP, "parquet.is_late_delivery", "no UPDATE events found")
     else:
-        has_col = 0
-        for val in update_rows["after"]:
-            try:
-                parsed = json.loads(val) if val else {}
-                if "is_late_delivery" in parsed:
-                    has_col += 1
-            except Exception:
-                pass
+        has_col = update_rows["after"].map(
+            lambda v: _has_field_in_json(v, "is_late_delivery")
+        ).sum()
         sev = SEVERITY_PASS if has_col > 0 else SEVERITY_WARN
         record(sev, "parquet.is_late_delivery",
                f"UPDATE {len(update_rows)} events, {has_col} contain is_late_delivery")
 
     # 2-D. after 필드 파싱 실패율
     print("\n-- 2-D. after parse failure rate --")
-    parse_fail = 0
-    for val in df["after"]:
-        if val is None:
-            continue
-        try:
-            json.loads(val)
-        except Exception:
-            parse_fail += 1
+    parse_fail = (~df["after"].map(_json_parse_ok)).sum()
     pct = parse_fail / total * 100 if total else 0
     record(
         SEVERITY_PASS if parse_fail == 0 else SEVERITY_WARN,
@@ -341,28 +363,19 @@ def layer3_consistency(conn) -> None:
     print("\n-- 3-A. Unique order coverage --")
     mysql_orders = scalar(conn, "SELECT COUNT(DISTINCT order_id) FROM orders")
 
-    # Parquet에서 order_id 추출 (after 또는 before JSON에서)
-    parquet_order_ids: set[str] = set()
-    for _, row in df.iterrows():
-        for field in ["after", "before"]:
-            val = row.get(field)
-            if val is None:
-                continue
-            try:
-                parsed = json.loads(val)
-                oid = parsed.get("order_id")
-                if oid:
-                    parquet_order_ids.add(oid)
-            except Exception:
-                pass
-
+    # after/before JSON에서 order_id 벡터화 추출
+    ids_after = df["after"].map(lambda v: _parse_json_field(v, "order_id")).dropna()
+    ids_before = (
+        df["before"].map(lambda v: _parse_json_field(v, "order_id")).dropna()
+        if "before" in df.columns else pd.Series([], dtype=str)
+    )
+    parquet_order_ids: set[str] = set(ids_after) | set(ids_before)
     parquet_unique = len(parquet_order_ids)
-    overlap = parquet_unique  # Parquet에 있는 order_id는 CDC로 추적된 것
 
     # 비율: CDC가 MySQL 전체를 얼마나 커버하는가
     # Note: initial bulk load (69,608 rows) bypassed CDC and went directly to MySQL.
     # Only events from replay_orders.py (~129) are in Parquet. Low coverage is expected.
-    coverage_pct = (overlap / mysql_orders * 100) if mysql_orders else 0.0
+    coverage_pct = (parquet_unique / mysql_orders * 100) if mysql_orders else 0.0
     sev = SEVERITY_PASS if coverage_pct >= 95.0 else SEVERITY_WARN
     note = " [expected: bulk load bypassed CDC; only replay events in Parquet]" if coverage_pct < 5 else ""
     record(sev, "consistency.order_id_coverage",
