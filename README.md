@@ -121,6 +121,12 @@ python scripts/replay_orders.py --dry-run
 
 # 전체 실행
 python scripts/replay_orders.py --duration-minutes 10
+
+# UPDATE 이벤트 포함 (10% 비율)
+python scripts/replay_orders.py --duration-minutes 10 --include-updates --update-ratio 0.1
+
+# 로그 레벨 조정
+python scripts/replay_orders.py --duration-minutes 10 --log-level DEBUG
 ```
 
 ### 7. Spark Streaming 실행
@@ -146,6 +152,7 @@ docker exec spark-master /opt/spark/bin/spark-submit \
 | `scripts/verify_restart_recovery.py` | Spark 재시작 후 checkpoint resume 검증 |
 | `scripts/verify_schema_evolution.py` | ALTER TABLE 후 Debezium schema 자동 감지 검증 |
 | `scripts/replay_orders.py` | 시간 압축 Event Replayer |
+| `scripts/fix_timestamps.py` | orders 테이블 NULL timestamp 일괄 수정 (초기 적재 보정용) |
 
 ```bash
 # DQ 전체 검증
@@ -156,6 +163,10 @@ python scripts/check_dq.py --layer 1
 
 # latency 측정
 python scripts/measure_latency.py
+
+# timestamp NULL 보정 (dry-run으로 먼저 확인)
+python scripts/fix_timestamps.py --dry-run
+python scripts/fix_timestamps.py
 ```
 
 ---
@@ -231,5 +242,8 @@ Layer 3 (Consist):  WARN  2 / FAIL 0  (bulk load CDC 미경유 — 설계상 exp
 - [x] Phase 4: End-to-end latency 측정 (p50/p95/p99)
 - [x] Phase 5-1: Spark 재시작 복구 검증 (checkpoint resume)
 - [x] Phase 5-2: Schema Evolution 검증 (ALTER TABLE ADD COLUMN)
-- [x] Phase 6: 코드 품질 개선 — Debezium 크리덴셜 template 분리, SQL allowlist, O(n²) 제거, pyarrow footer 최적화, 커넥션 try/finally 보장
+- [x] Phase 6: 코드 품질 개선
+  - **보안/성능**: Debezium 크리덴셜 template 분리 (envsubst), SQL table allowlist, O(n²) concat 제거, pyarrow footer 최적화, DB 커넥션 try/finally 보장
+  - **CLI 개선**: fix_timestamps `--dry-run`, replay_orders `--include-updates`/`--log-level`/`--limit`, verify_restart_recovery `.env` 자동 로드, subprocess timeout 추가
+  - **코드 정리**: 전 스크립트 `print` → `logging` 교체, 매직 넘버 상수화, `layer1_mysql` 4개 서브함수 분해, `_rename_columns` 헬퍼 분리, 미사용 파라미터 제거
 - [x] Phase 7: Data Quality 3계층 검증 + timestamp 버그 수정
