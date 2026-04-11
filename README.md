@@ -74,7 +74,7 @@ Spark 분할 작업 (`spark-submit/split_orders_70_30.py`) 실행 후 `orders_in
 
 ```bash
 cp .env.example .env
-# .env 수정: MYSQL_ROOT_PASSWORD, MYSQL_USER, MYSQL_PASSWORD
+# .env 수정: MYSQL_ROOT_PASSWORD, MYSQL_USER, MYSQL_PASSWORD, DBZ_USER, DBZ_PASSWORD
 ```
 
 ### 2. 데이터 준비
@@ -100,7 +100,8 @@ docker compose up -d
 
 ### 4. Debezium 커넥터 등록
 
-커넥터 설정은 `.env`의 `DBZ_USER` / `DBZ_PASSWORD`를 템플릿에 주입해서 등록합니다.
+커넥터 설정은 `docker/register-mysql-debezium.json.template`에 `${DBZ_USER}` / `${DBZ_PASSWORD}` 플레이스홀더로 관리됩니다.
+실행 시 `.env` 값이 `envsubst`로 주입되므로 **크리덴셜이 git에 커밋되지 않습니다**.
 
 ```bash
 source .env && bash docker/register_connector.sh
@@ -230,5 +231,5 @@ Layer 3 (Consist):  WARN  2 / FAIL 0  (bulk load CDC 미경유 — 설계상 exp
 - [x] Phase 4: End-to-end latency 측정 (p50/p95/p99)
 - [x] Phase 5-1: Spark 재시작 복구 검증 (checkpoint resume)
 - [x] Phase 5-2: Schema Evolution 검증 (ALTER TABLE ADD COLUMN)
-- [x] Phase 6: 코드 정리 (dead code 제거, 보안 강화, 버그 수정)
+- [x] Phase 6: 코드 품질 개선 — Debezium 크리덴셜 template 분리, SQL allowlist, O(n²) 제거, pyarrow footer 최적화, 커넥션 try/finally 보장
 - [x] Phase 7: Data Quality 3계층 검증 + timestamp 버그 수정
