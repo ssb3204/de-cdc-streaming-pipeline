@@ -10,6 +10,7 @@ MySQL 변경 발생 시각(ts_ms) → Spark Parquet 저장 시각(processed_at) 
     python scripts/measure_latency.py --raw         # 개별 레코드 출력
 """
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -17,6 +18,8 @@ import pandas as pd
 
 _ROOT = Path(__file__).parent.parent
 PARQUET_DIR = _ROOT / "data" / "cdc_output"
+
+RAW_DISPLAY_LIMIT: int = 50
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,14 +47,14 @@ def parse_args() -> argparse.Namespace:
 
 def load_parquet(parquet_dir: Path) -> pd.DataFrame:
     if not parquet_dir.exists():
-        print(f"[ERROR] Parquet 디렉토리 없음: {parquet_dir}", file=sys.stderr)
-        print("  Spark 스트리밍 잡을 먼저 실행하세요.", file=sys.stderr)
+        logging.error("Parquet 디렉토리 없음: %s", parquet_dir)
+        logging.error("  Spark 스트리밍 잡을 먼저 실행하세요.")
         sys.exit(1)
 
     try:
         df = pd.read_parquet(parquet_dir)
     except Exception as e:
-        print(f"[ERROR] Parquet 읽기 실패: {e}", file=sys.stderr)
+        logging.error("Parquet 읽기 실패: %s", e)
         sys.exit(1)
 
     return df
@@ -60,11 +63,10 @@ def load_parquet(parquet_dir: Path) -> pd.DataFrame:
 def compute_latency(df: pd.DataFrame) -> pd.DataFrame:
     """processed_at이 있는 레코드에서 latency_ms 계산."""
     if "processed_at" not in df.columns:
-        print(
-            "[ERROR] 'processed_at' 컬럼 없음.\n"
+        logging.error(
+            "'processed_at' 컬럼 없음.\n"
             "  stream_cdc.py에 processed_at 컬럼이 추가된 후 수집된 데이터가 필요합니다.\n"
-            "  Spark 스트리밍 잡을 재시작 후 이벤트를 주입하세요.",
-            file=sys.stderr,
+            "  Spark 스트리밍 잡을 재시작 후 이벤트를 주입하세요."
         )
         sys.exit(1)
 
@@ -72,8 +74,8 @@ def compute_latency(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["processed_at", "ts_ms"]).copy()
 
     if df.empty:
-        print("[WARN] processed_at이 있는 레코드가 없습니다.", file=sys.stderr)
-        print("  Spark 재시작 후 새 이벤트를 주입하면 측정 가능합니다.", file=sys.stderr)
+        logging.warning("processed_at이 있는 레코드가 없습니다.")
+        logging.warning("  Spark 재시작 후 새 이벤트를 주입하면 측정 가능합니다.")
         sys.exit(0)
 
     # ts_ms: Debezium이 기록한 MySQL 이벤트 발생 시각 (Unix ms)
@@ -154,7 +156,7 @@ def _print_row(st: dict) -> None:
 def print_raw(df: pd.DataFrame) -> None:
     cols = ["topic", "op", "ts_ms_dt", "processed_at", "latency_ms"]
     available = [c for c in cols if c in df.columns]
-    display = df[available].sort_values("latency_ms", ascending=False).head(50)
+    display = df[available].sort_values("latency_ms", ascending=False).head(RAW_DISPLAY_LIMIT)
     display = display.copy()
     if "topic" in display.columns:
         display["topic"] = display["topic"].str.split(".").str[-1]
@@ -162,6 +164,8 @@ def print_raw(df: pd.DataFrame) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+
     args = parse_args()
 
     df = load_parquet(PARQUET_DIR)
@@ -172,13 +176,13 @@ def main() -> None:
         mask = df["topic"].str.contains(args.topic, na=False)
         df = df[mask]
         if df.empty:
-            print(f"[WARN] '{args.topic}' 토픽 레코드 없음")
+            logging.warning("'%s' 토픽 레코드 없음", args.topic)
             sys.exit(0)
 
     if args.op:
         df = df[df["op"] == args.op]
         if df.empty:
-            print(f"[WARN] op='{args.op}' 레코드 없음")
+            logging.warning("op='%s' 레코드 없음", args.op)
             sys.exit(0)
 
     if args.raw:

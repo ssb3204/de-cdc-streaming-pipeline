@@ -33,6 +33,7 @@ BOOTSTRAP = "kafka:29092"
 TOPIC = "ecommerce.ecommerce.orders"
 NEW_COLUMN = "is_late_delivery"
 PARQUET_PATH = Path(__file__).parent.parent / "data" / "cdc_output"
+KAFKA_SAMPLE_WINDOW: int = 30
 
 
 # ─────────────────────────────────────────────
@@ -71,7 +72,7 @@ def fetch_messages(start_offset: int, count: int) -> list[str]:
         ],
         capture_output=True, text=True, timeout=20
     )
-    lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     return lines
 
 
@@ -88,12 +89,11 @@ def parse_after_fields(raw: str) -> dict | None:
 # 검증 1: Kafka 이벤트에 새 컬럼 포함 여부
 # ─────────────────────────────────────────────
 
-def check_kafka(args: argparse.Namespace) -> bool:
+def check_kafka() -> bool:
     latest = get_latest_offset()
     print(f"[kafka] 현재 latest offset: {latest}")
 
-    # 끝에서 최대 30개 메시지를 검사
-    sample_count = min(30, latest)
+    sample_count = min(KAFKA_SAMPLE_WINDOW, latest)
     start = max(0, latest - sample_count)
 
     print(f"[kafka] offset {start} ~ {latest} ({sample_count}건) 검사 중...")
@@ -136,7 +136,7 @@ def check_kafka(args: argparse.Namespace) -> bool:
 # 검증 2: Parquet에서 새 컬럼 확인
 # ─────────────────────────────────────────────
 
-def check_parquet(args: argparse.Namespace) -> bool:
+def check_parquet() -> bool:
     orders_path = PARQUET_PATH / "topic=ecommerce.ecommerce.orders"
 
     if not orders_path.exists():
@@ -223,14 +223,14 @@ def main() -> None:
         print("=" * 50)
         print("[ Kafka 이벤트 검증 ]")
         print("=" * 50)
-        results.append(check_kafka(args))
+        results.append(check_kafka())
 
     if args.parquet_check:
         print()
         print("=" * 50)
         print("[ Parquet 검증 ]")
         print("=" * 50)
-        results.append(check_parquet(args))
+        results.append(check_parquet())
 
     print()
     if all(results):

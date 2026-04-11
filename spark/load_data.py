@@ -1,5 +1,7 @@
 import glob
+import logging
 import os
+from typing import Optional
 
 import pandas as pd
 from sqlalchemy import create_engine
@@ -29,8 +31,29 @@ engine = create_engine(DATABASE_URL, echo=False, future=True)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "spark-submit", "data")
 
+# 테이블별 컬럼 rename 매핑 (CSV 오타 → DB 컬럼명)
+_COLUMN_RENAMES: dict[str, dict[str, str]] = {
+    "products": {
+        "product_name_lenght": "product_name_length",
+        "product_description_lenght": "product_description_length",
+    }
+}
 
-def load_table(csv_filename: str, table_name: str, parse_dates=None, chunksize: int = 10000):
+
+def _rename_columns(chunk: pd.DataFrame, table_name: str) -> pd.DataFrame:
+    """테이블별 컬럼 rename 적용. 매핑이 없으면 그대로 반환."""
+    renames = _COLUMN_RENAMES.get(table_name)
+    if renames:
+        chunk = chunk.rename(columns=renames)
+    return chunk
+
+
+def load_table(
+    csv_filename: str,
+    table_name: str,
+    parse_dates: Optional[list[str]] = None,
+    chunksize: int = 10000,
+) -> None:
     csv_path = os.path.join(DATA_DIR, csv_filename)
 
     # Spark 출력은 디렉토리(part-*.csv) 형태로 저장됨
@@ -42,11 +65,10 @@ def load_table(csv_filename: str, table_name: str, parse_dates=None, chunksize: 
     elif not os.path.exists(csv_path):
         raise FileNotFoundError(f"{csv_path} 파일이 존재하지 않습니다.")
 
-    print(f"\n=== [{table_name}] {csv_path} 적재 시작 ===")
+    logging.info("\n=== [%s] %s 적재 시작 ===", table_name, csv_path)
 
     preview_df = pd.read_csv(csv_path, nrows=5)
-    print(f"[{table_name}] 샘플 5행:")
-    print(preview_df)
+    logging.info("[%s] 샘플 5행:\n%s", table_name, preview_df)
 
     total_rows = 0
 
@@ -60,13 +82,7 @@ def load_table(csv_filename: str, table_name: str, parse_dates=None, chunksize: 
                     chunk[col] = chunk[col].dt.tz_localize(None) if chunk[col].dt.tz is None \
                         else chunk[col].dt.tz_convert(None)
 
-        # 여기부터 추가
-        if table_name == "products":
-            chunk = chunk.rename(columns={
-                "product_name_lenght": "product_name_length",
-                "product_description_lenght": "product_description_length",
-            })
-        # 여기까지 추가
+        chunk = _rename_columns(chunk, table_name)
 
         rows_in_chunk = len(chunk)
         total_rows += rows_in_chunk
@@ -77,12 +93,17 @@ def load_table(csv_filename: str, table_name: str, parse_dates=None, chunksize: 
             if_exists="append",
             index=False,
         )
-        print(f"[{table_name}] {rows_in_chunk}행 적재 (누적 {total_rows}행)")
+        logging.info("[%s] %d행 적재 (누적 %d행)", table_name, rows_in_chunk, total_rows)
 
-    print(f"=== [{table_name}] 적재 완료 (총 {total_rows}행) ===")
+    logging.info("=== [%s] 적재 완료 (총 %d행) ===", table_name, total_rows)
 
 
-def main():
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+    )
+
     # 1. customers 전체 적재
     load_table(
         csv_filename="olist_customers_dataset.csv",
@@ -90,7 +111,7 @@ def main():
         parse_dates=None
     )
 
-    # 2. products 전체 적재 (오타 컬럼 rename은 load_table 안에서 처리하는 걸로)
+    # 2. products 전체 적재 (오타 컬럼 rename은 _rename_columns에서 처리)
     load_table(
         csv_filename="olist_products_dataset.csv",
         table_name="products",
@@ -119,7 +140,7 @@ def main():
         ]
     )
 
-    print("\n=== 모든 테이블 초기 적재 완료 ===")
+    logging.info("\n=== 모든 테이블 초기 적재 완료 ===")
 
 
 if __name__ == "__main__":
