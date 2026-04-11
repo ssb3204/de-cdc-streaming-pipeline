@@ -23,6 +23,8 @@
    - [ADR-008 Event Replayer 구현 세부 설계](#adr-008-event-replayer-구현-세부-설계-2026-04-08)
    - [ADR-009 Spark Structured Streaming 선택의 재검토](#adr-009-spark-structured-streaming-선택의-재검토-2026-04-09)
    - [ADR-010 End-to-end Latency 측정 설계](#adr-010-end-to-end-latency-측정-설계-2026-04-10)
+   - [ADR-011 Schema Evolution 검증 설계](#adr-011-schema-evolution-검증-설계-2026-04-11)
+   - [ADR-012 Data Quality 3계층 검증 설계](#adr-012-data-quality-3계층-검증-설계-2026-04-11)
 6. [수정된 개선 우선순위](#6-수정된-개선-우선순위)
 7. [이력서 문장 Before/After](#7-이력서-문장-beforeafter)
 8. [학습 노트](#8-학습-노트)
@@ -859,5 +861,67 @@ op=u (UPDATE): 66건
 
 **이력서 문장**:
 > `ALTER TABLE ADD COLUMN` 시나리오에서 Debezium의 schema history 자동 갱신 및 후속 이벤트에 신규 컬럼 반영을 Kafka 이벤트 + Parquet 양쪽에서 검증. Spark 재배포 없이 schema evolution 수용 가능한 JSON string sink 설계 확인.
+
+---
+
+### ADR-012 Data Quality 3계층 검증 설계 (2026-04-11)
+
+**문제 인식**
+
+파이프라인이 정상 동작하는 것처럼 보여도 데이터 자체에 문제가 있을 수 있다.
+이번 프로젝트에서 DQ 체크 없이 진행했다면 발견하지 못했을 이슈:
+- `orders.order_purchase_timestamp` 99.9% NULL — 파이프라인은 정상, 데이터는 무의미
+- FK 고아 레코드, PK 중복이 쌓여도 Spark 집계는 그냥 실행됨
+
+DE 직무에서 "파이프라인이 돌아간다"와 "데이터를 신뢰할 수 있다"는 전혀 다른 문제다.
+
+**결정: 3계층 DQ 체크 스크립트 (`scripts/check_dq.py`)**
+
+| 레이어 | 대상 | 체크 항목 |
+|--------|------|-----------|
+| Layer 1 (Source) | MySQL | PK null/중복, FK 고아, row count, 핵심 컬럼 null 비율 |
+| Layer 2 (CDC) | Parquet | op 분포, after JSON 파싱 실패율, schema evolution 컬럼 존재 |
+| Layer 3 (Consistency) | MySQL vs Parquet | order_id 커버리지, CREATE 이벤트 수 비교 |
+
+**대안 검토**
+
+| 방법 | 기각 이유 |
+|------|-----------|
+| Great Expectations | 로컬 학습용 프로젝트에 과한 의존성. 이 규모에서 커스텀 스크립트로 충분 |
+| dbt test | dbt 없이 raw MySQL/Parquet만 다루는 이 프로젝트에 맞지 않음 |
+| 수동 쿼리 | 재현 불가, 기록 안 됨. 다음 세션에서 같은 체크를 반복해야 함 |
+
+**발견한 버그 (DQ 스크립트 실행 결과로 식별)**
+
+`orders.order_purchase_timestamp` 99.9% NULL 원인 분석:
+
+```
+CSV 원본:  "2016-09-04T21:15:19.000Z"  (ISO 8601, UTC timezone suffix)
+         ↓ pandas parse_dates
+         Timestamp('2016-09-04 21:15:19+0000', tz='UTC')  ← timezone-aware
+         ↓ pymysql → MySQL DATETIME
+         NULL  (DATETIME 타입은 timezone 정보 미지원 → 조용히 NULL 저장)
+```
+
+수정 내용:
+- `spark/load_data.py`: `parse_dates` 후 `.dt.tz_convert(None)` 추가 → timezone strip
+- `scripts/fix_timestamps.py`: 기존 69,608건 UPDATE로 복구
+
+**검증 결과 (2026-04-11, 로컬 Docker)**
+
+```
+Layer 1 (MySQL):   PASS 14 / FAIL 0
+Layer 2 (Parquet): PASS  8 / FAIL 0
+Layer 3 (Consist): WARN  2 / FAIL 0  ← bulk load가 CDC 바이패스, 설계상 expected
+
+최종: PASS 22 / WARN 2 / FAIL 0
+```
+
+Layer 3 WARN 해설: 초기 70% bulk load는 `load_data.py`로 MySQL에 직접 적재 (CDC 미경유).
+Parquet에는 `replay_orders.py`로 발생한 이벤트만 존재 (63 CREATE + 66 UPDATE = 129건).
+MySQL 전체 69,674건 대비 커버리지 0.1%는 이 아키텍처에서 의도된 차이.
+
+**이력서 문장**:
+> MySQL 소스 → CDC Parquet → 일관성 3계층 DQ 체크 스크립트를 직접 구현. DQ 실행 중 `order_purchase_timestamp` 99.9% NULL 버그(UTC-aware datetime → MySQL DATETIME 호환 문제)를 식별하고, `tz_convert(None)` 수정 + 69,608건 UPDATE 복구까지 완료. PASS 22 / WARN 2 / FAIL 0 달성.
 
 **검증 스크립트**: `scripts/verify_schema_evolution.py`
