@@ -787,3 +787,77 @@ UPDATE 30건: p50= 298ms  p95= 301ms  p99= 301ms  max= 301ms
 
 결론: Debezium → Kafka → Spark → Parquet 경로에서 **p50 ≈ 300ms, p95 ≈ 500ms** 확인.
 이 수치는 이력서/포트폴리오 기재용이며, 프로덕션 멀티브로커 환경과 직접 비교 불가.
+
+---
+
+### ADR-011: Schema Evolution 검증 설계 (2026-04-11)
+
+**Context**: 운영 파이프라인에서 스키마 변경(컬럼 추가/삭제)은 피할 수 없다. Debezium이 이 변화를 자동으로 감지하고 후속 이벤트에 반영하는지 실제로 검증해야 한다. Phase 5-2의 목표다.
+
+**시나리오**:
+```sql
+-- 기존: 8 컬럼
+-- ALTER 실행
+ALTER TABLE orders ADD COLUMN is_late_delivery TINYINT(1) DEFAULT NULL;
+
+-- 새 컬럼에 값 주입 (UPDATE 20건)
+UPDATE orders
+SET is_late_delivery = CASE
+    WHEN order_delivered_customer_date > order_estimated_delivery_date THEN 1
+    ELSE 0
+END
+WHERE order_delivered_customer_date IS NOT NULL
+LIMIT 20;
+```
+
+**Decision**: `ALTER TABLE ADD COLUMN` + 소량 UPDATE로 스키마 변화를 유도하고, Kafka 이벤트와 Parquet 양쪽에서 새 컬럼 포함 여부를 검증한다.
+
+**Alternatives**:
+
+| 방법 | 평가 |
+|------|------|
+| **ADD COLUMN + UPDATE (채택)** | 가장 일반적인 운영 시나리오. 추가 컬럼에 실제 값 주입 가능 |
+| ADD COLUMN만 실행 (값 없이) | 스키마 변화는 확인 가능하지만 payload에서 null만 보임 |
+| DROP COLUMN | Debezium의 schema history 관리와 충돌 가능, 검증 복잡도 ↑ |
+| RENAME COLUMN | MySQL 8.0에서 지원하지만 Debezium schema history에 영향 큼, 프로젝트 목적 초과 |
+
+**검증 결과 (2026-04-11, 로컬 Docker)**:
+
+Kafka 이벤트 (최근 30건 샘플):
+```
+ALTER 이전 이벤트: is_late_delivery 미포함  10건
+ALTER 이후 이벤트: is_late_delivery 포함    20건  [PASS]
+```
+
+Parquet (stream_cdc.py 처리 후):
+```
+전체 rows: 129건
+op=u (UPDATE): 66건
+  └─ is_late_delivery 포함: 20건  [PASS]
+  └─ 샘플 값: 0 (배송 지연 없음)
+```
+
+**Debezium schema evolution 동작 원리**:
+- Debezium은 `schema-changes.ecommerce` 토픽에 DDL 변경 이력을 기록한다
+- `ALTER TABLE` 실행 시 binlog에 DDL 이벤트가 남고, Debezium이 이를 감지해 내부 스키마를 즉시 갱신한다
+- 이후 발행되는 CDC 이벤트의 `schema.fields`에 새 컬럼이 자동 포함된다
+- `stream_cdc.py`는 `payload.after`를 JSON 문자열로 저장하므로, Spark 재컴파일/재시작 없이 새 컬럼이 Parquet에 그대로 보존된다
+
+**stream_cdc.py가 스키마 변화에 유연한 이유**:
+
+`stream_cdc.py`는 `payload.after` 전체를 JSON 문자열(string)로 저장한다:
+```python
+.withColumn("after", get_json_object(col("v"), "$.payload.after"))
+```
+이 설계는 Debezium 이벤트의 스키마 변화를 Spark 코드 수정 없이 수용한다. Parquet 컬럼 구조 자체는 고정(topic, offset, op, ts_ms, before, after, processed_at)이고, 실제 row 내용은 `after` JSON 안에 보존된다.
+
+**Trade-offs**:
+- (-) `after` 가 JSON string이므로 컬럼별 쿼리 시 `get_json_object()` 필요 (타입 안전성 없음)
+- (-) Parquet 통계/압축 효율이 구조화 컬럼 방식보다 낮음
+- (+) Spark 재시작 없이 스키마 변화 수용 → zero-downtime schema evolution
+- (+) Debezium 스키마 변경이 다운스트림(Spark)에 전파되지 않음 → 결합도 최소
+
+**이력서 문장**:
+> `ALTER TABLE ADD COLUMN` 시나리오에서 Debezium의 schema history 자동 갱신 및 후속 이벤트에 신규 컬럼 반영을 Kafka 이벤트 + Parquet 양쪽에서 검증. Spark 재배포 없이 schema evolution 수용 가능한 JSON string sink 설계 확인.
+
+**검증 스크립트**: `scripts/verify_schema_evolution.py`
