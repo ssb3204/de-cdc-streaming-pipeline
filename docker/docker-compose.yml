@@ -5,8 +5,15 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: "2181"
       ZOOKEEPER_TICK_TIME: "2000"
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok,srvr"
     ports:
       - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - de-net
 
@@ -14,7 +21,9 @@ services:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
+    restart: on-failure
     ports:
       - "9092:9092"   # 호스트: localhost:9092
     environment:
@@ -32,6 +41,12 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
     networks:
       - de-net
 
@@ -57,9 +72,12 @@ services:
   kafka-connect:
     image: debezium/connect:2.7.3.Final
     container_name: kafka-connect
+    restart: on-failure
     depends_on:
-      - kafka
-      - mysql
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_started
     ports:
       - "8083:8083"
     environment:

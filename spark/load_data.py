@@ -31,11 +31,13 @@ engine = create_engine(DATABASE_URL, echo=False, future=True)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "spark-submit", "data")
 
-# 테이블별 컬럼 rename 매핑 (CSV 오타 → DB 컬럼명)
+# 테이블별 컬럼 rename 매핑 (CSV 컬럼명 → DB 컬럼명)
+# Olist 원본 CSV와 init.sql 모두 오타(lenght)를 사용하므로 rename 불필요.
+# CSV가 정규 컬럼명(length)으로 저장된 경우에만 DB 오타에 맞춰 역매핑.
 _COLUMN_RENAMES: dict[str, dict[str, str]] = {
     "products": {
-        "product_name_lenght": "product_name_length",
-        "product_description_lenght": "product_description_length",
+        "product_name_length": "product_name_lenght",
+        "product_description_length": "product_description_lenght",
     }
 }
 

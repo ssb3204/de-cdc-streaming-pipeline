@@ -25,6 +25,8 @@
    - [ADR-010 End-to-end Latency 측정 설계](#adr-010-end-to-end-latency-측정-설계-2026-04-10)
    - [ADR-011 Schema Evolution 검증 설계](#adr-011-schema-evolution-검증-설계-2026-04-11)
    - [ADR-012 Data Quality 3계층 검증 설계](#adr-012-data-quality-3계층-검증-설계-2026-04-11)
+   - [ADR-013 v2 방향 전환 — CDC sink 교체](#adr-013-v2-방향-전환--cdc-sink를-parquet-dump에서-운영리스크-지표-테이블로-교체-2026-04-16)
+   - [ADR-014 윈도우 크기 재조정 — 압축 시간 기준 세분화](#adr-014-윈도우-크기-재조정--압축-시간-기준-세분화-2026-04-16)
 6. [수정된 개선 우선순위](#6-수정된-개선-우선순위)
 7. [이력서 문장 Before/After](#7-이력서-문장-beforeafter)
 8. [학습 노트](#8-학습-노트)
@@ -938,3 +940,97 @@ MySQL 전체 69,674건 대비 커버리지 0.1%는 이 아키텍처에서 의도
 > MySQL 소스 → CDC Parquet → 일관성 3계층 DQ 체크 스크립트를 직접 구현. DQ 실행 중 `order_purchase_timestamp` 99.9% NULL 버그(UTC-aware datetime → MySQL DATETIME 호환 문제)를 식별하고, `tz_convert(None)` 수정 + 69,608건 UPDATE 복구까지 완료. PASS 22 / WARN 2 / FAIL 0 달성.
 
 **검증 스크립트**: `scripts/verify_schema_evolution.py`
+
+### ADR-013: v2 방향 전환 — CDC sink를 Parquet dump에서 운영·리스크 지표 테이블로 교체 (2026-04-16)
+
+**Context**
+
+무신사페이먼츠 공고 원문 "배치 파이프라인(**CDC**, 이벤트 스트리밍)을 통해 **핵심 지표를 제공**한 경험" (출처: `docs/kafka_requirements_from_job_postings.md`).
+기존 v1 Spark sink(`stream_cdc.py`)는 Parquet raw dump — 소비처가 없어 "제공·지원" 동사 미성립.
+
+**Alternatives**
+
+1. Parquet 유지 + 별도 BI 레이어 도입 — 새 컴포넌트 필요, 로컬 복잡도↑
+2. Spark sink만 교체, 집계 테이블을 MySQL에 직접 저장 — **채택**
+3. Kafka Streams로 재작성 — 이미 동작하는 Spark 자산 폐기, 손실 큼
+
+**Decision**
+
+- Spark Structured Streaming job 2개 추가 (기존 `stream_cdc.py`는 유지)
+  - `spark/stream_a1_orders.py` — 분당 주문 건수 (운영 지표)
+  - `spark/stream_b1_cancel_rate.py` — 실시간 취소율 (리스크 지표)
+- Sink: MySQL 집계 테이블 `minute_order_summary`, `ten_minute_cancel_rate`
+  - 테이블명은 비개발자 가독성 우선 (`metrics_*` prefix 기각)
+  - PK=`window_start`, `mysql.connector.REPLACE INTO`로 per-row upsert (Spark JDBC는 upsert 미지원)
+- A1 = ~~1분 tumbling~~ → 10초 tumbling / B1 = ~~10분 sliding(slide=1분)~~ → 1분 sliding(slide=30초) (ADR-014), B1 = canceled만 (unavailable은 INSERT 시점 결정 多 → UPDATE 포착 명분 약함)
+
+**Trade-offs**
+
+- `foreachBatch` + `collect()`는 per-batch 전체 결과를 driver로 끌어오므로 윈도우 수가 수만 단위로 커지면 OOM 위험 — 현 규모(분당 수~수십 윈도우)에서는 안전
+- outputMode=`update`로 윈도우 진행 중에도 count 증가를 대시보드에 즉시 반영. append 모드였다면 watermark 만료 후에만 행 출력 → 실시간성 손실
+- B1은 CDC가 없으면 INSERT-only 스트림에서 canceled 전이 포착 불가 → "왜 CDC를 썼는가"에 대한 답이 지표 정의 자체에 내장됨 (`docs/DIRECTION_v2.md` §3 B1)
+
+**Validation (2026-04-16)**
+
+| 항목 | 결과 |
+|------|------|
+| S1 실측 | 전수 n=69,674, canceled 429(0.616%), unavailable 561(0.805%), order_items 토픽 157,436건 |
+| S3 A1 | 10초 tumbling 윈도우 35+ rows upsert 확인 (ADR-014 적용 후) |
+| S4 B1 (1차) | batch 0에서 73 윈도우 upsert, canceled 0 (과거 Kafka 잔여에 UPDATE 없음 — 정상) |
+| S4 B1 (2차) | `--include-updates` 3,000건 replay → 9개 윈도우에서 cancel_rate 0.18%~1.2% 확인 |
+| op='c' 필터 | snapshot(op='r') 69,674건 집계 미반영 확인 |
+
+**이력서 문장**
+
+> CDC 파이프라인의 소비처를 Parquet dump에서 **MySQL 집계 테이블**로 교체하여 "운영·리스크 지표를 실시간 제공" 서사로 전환. A1(주문 건수) 10초 tumbling, B1(취소율) 1분 sliding/30초 slide로 구현(ADR-014 압축 시간 기준 재조정). B1은 `canceled`로의 UPDATE 전이를 Debezium binlog로 포착 — INSERT-only 스트림으로 성립 불가한 지표를 선정해 **CDC 채택 이유를 지표 정의 자체에 내장**. `--include-updates` replay로 9개 윈도우에서 cancel_rate 0.18%~1.2% 실측 검증 완료. 기준선 취소율 0.616%(n=69,674).
+
+**관련 문서**: `docs/DIRECTION_v2.md` (§3 지표 정의, §6 S1 실측, §7 S2 결정)
+
+---
+
+### ADR-014: 윈도우 크기 재조정 — 압축 시간 기준 세분화 (2026-04-16)
+
+**Context**
+
+ADR-013에서 A1=1분 tumbling, B1=10분 sliding(1분 slide)으로 결정했으나, Replayer가 186일 데이터를 10분에 압축(~26,900x)하는 환경에서 원본 시간 기준 윈도우가 부적합함을 검증 중 확인.
+
+- 원본 시간 1분 tumbling → 압축 시간 기준 ~0.002초. Spark가 micro-batch마다 수천 개 빈 윈도우와 소수의 과밀 윈도우 생성
+- 원본 시간 10분 sliding → 압축 시간 기준 전체 replay가 하나의 윈도우에 수렴. 비율 지표(cancel_rate)의 의미 소실
+
+**Alternatives**
+
+| 옵션 | 평가 |
+|------|------|
+| 원본 시간 유지 (A1: 1분, B1: 10분) | 압축 시 빈 윈도우 多, 전체가 1윈도우에 수렴 — **기각** |
+| **압축 시간 기준 (A1: 10초, B1: 1분/30초)** | 10분 replay에서 ~60개 A1 윈도우, B1 분모 안정 — **채택** |
+| Replayer에 `--window-base=compressed` 파라미터 추가 | 과잉 추상화, 윈도우 크기는 Spark job 내 상수로 충분 |
+| Replayer 압축 비율 낮춤 (1시간 replay) | 검증 사이클 시간 6x 증가, 득보다 실 |
+
+**Decision**
+
+- A1: ~~1분 tumbling~~ → **10초 tumbling**, watermark 20초
+- B1: ~~10분 sliding, 1분 slide~~ → **1분 sliding, 30초 slide**, watermark 1분
+- 윈도우 크기는 Spark job 소스 내 상수로 관리 (런타임 파라미터화 불필요)
+
+**Rationale**
+
+- 10분 replay에서 A1 10초 tumbling → ~60개 윈도우, 평균 ~30건/윈도우. 대시보드에서 시간별 추이가 보이는 최소 해상도.
+- B1 1분 sliding/30초 slide → 분모(전체 주문수)가 충분히 커서 비율 지표가 안정적. 30초 slide로 변화 포착 속도도 확보.
+- 프로덕션 환경(압축 없음)에서는 원본 시간 기준 윈도우로 복원 필요 — 이 결정은 데모/검증 환경 한정.
+
+**Trade-offs**
+
+- (-) 윈도우 크기가 "프로덕션 현실적"이 아님 — 10초 tumbling은 실운영에서 과도한 세분화. 면접 시 "데모 환경 압축 비율 때문에 조정했으며, 프로덕션에서는 1분/10분으로 복원한다" 설명 필요
+- (-) 프로덕션 전환 시 상수 2개 변경 필요 (단, 설정 파일화는 현 규모에 과잉)
+- (+) 10분 replay로 의미 있는 시계열 데이터 생성 — 빈 윈도우 없이 대시보드 데모 가능
+- (+) B1 cancel_rate가 실제로 0이 아닌 값을 출력함을 검증 완료 (0.18%~1.2% 범위, 9개 윈도우)
+
+**Validation (2026-04-16)**
+
+| 항목 | 결과 |
+|------|------|
+| A1 윈도우 수 | 35+ 윈도우 (10초 tumbling, 3,000건 replay) |
+| B1 cancel_rate > 0 | 9개 윈도우에서 0.18%~1.2% — `--include-updates` canceled 전이 포착 확인 |
+| Kafka 메시지 | 72,925건 (69,608 snapshot + 3,000 INSERT + 317 UPDATE) |
+
+**관련 문서**: `docs/DIRECTION_v2.md` (§7 S2 결정 사항), ADR-013

@@ -212,8 +212,16 @@ SET order_status = %s,
 WHERE order_id = %s
 """
 
+_CANCEL_SQL = """
+UPDATE orders
+SET order_status = 'canceled'
+WHERE order_id = %s
+"""
+
 _STATUS_DELIVERED = "delivered"
+_STATUS_CANCELED  = "canceled"
 _STATUS_INITIAL   = "invoiced"   # UPDATE 주입 시 첫 INSERT는 이 상태로
+_STATUS_PRE_CANCEL = "shipped"   # canceled 전이용 초기 상태
 
 
 def _to_mysql_dt(val) -> Optional[str]:
@@ -235,7 +243,7 @@ def run_replay(df: pd.DataFrame, ratio: float, cfg: ReplayConfig) -> None:
     inserted = 0
     skipped = 0
     updates_sent = 0
-    pending_updates: list[tuple[float, str, Optional[str]]] = []  # (fire_at, order_id, delivered_date)
+    pending_updates: list[tuple[float, str, Optional[str], bool]] = []  # (fire_at, order_id, delivered_date, is_cancel)
 
     ts_col = df["order_purchase_timestamp"]
     start_wall = time.monotonic()
@@ -257,14 +265,19 @@ def run_replay(df: pd.DataFrame, ratio: float, cfg: ReplayConfig) -> None:
                 if gap > 0:
                     # 대기 중인 UPDATE 먼저 발행 (O(n) — list comprehension)
                     now = time.monotonic()
-                    remaining: list[tuple[float, str, Optional[str]]] = []
+                    remaining: list[tuple[float, str, Optional[str], bool]] = []
                     for upd in pending_updates:
-                        fire_at, oid, ddate = upd
+                        fire_at, oid, ddate, is_cancel = upd
                         if now >= fire_at:
                             try:
-                                cursor.execute(_UPDATE_SQL, (_STATUS_DELIVERED, ddate, oid))
-                                updates_sent += 1
-                                logging.debug("UPDATE sent: %s -> delivered", oid)
+                                if is_cancel:
+                                    cursor.execute(_CANCEL_SQL, (oid,))
+                                    updates_sent += 1
+                                    logging.debug("UPDATE sent: %s -> canceled", oid)
+                                else:
+                                    cursor.execute(_UPDATE_SQL, (_STATUS_DELIVERED, ddate, oid))
+                                    updates_sent += 1
+                                    logging.debug("UPDATE sent: %s -> delivered", oid)
                             except Exception as e:
                                 logging.warning("UPDATE 실패 %s: %s", oid, e)
                         else:
@@ -275,13 +288,23 @@ def run_replay(df: pd.DataFrame, ratio: float, cfg: ReplayConfig) -> None:
 
                 prev_ts = cur_ts
 
-                # INSERT 상태 결정 (UPDATE 주입 활성화 시 일부는 invoiced로 시작)
+                # INSERT 상태 결정 (UPDATE 주입 활성화 시 일부는 초기 상태로 시작)
                 inject_update = (
                     cfg.include_updates
                     and row.order_status == _STATUS_DELIVERED
                     and random.random() < cfg.update_ratio
                 )
-                insert_status = _STATUS_INITIAL if inject_update else row.order_status
+                # canceled 주문은 100% UPDATE 전이 (shipped → canceled)
+                inject_cancel = (
+                    cfg.include_updates
+                    and row.order_status == _STATUS_CANCELED
+                )
+                if inject_cancel:
+                    insert_status = _STATUS_PRE_CANCEL
+                elif inject_update:
+                    insert_status = _STATUS_INITIAL
+                else:
+                    insert_status = row.order_status
                 delivered_date = _to_mysql_dt(getattr(row, "order_delivered_customer_date", None))
 
                 try:
@@ -300,9 +323,12 @@ def run_replay(df: pd.DataFrame, ratio: float, cfg: ReplayConfig) -> None:
                     )
                     if affected == 1:
                         inserted += 1
-                        if inject_update:
+                        if inject_cancel:
                             delay = random.uniform(cfg.update_delay_min, cfg.update_delay_max)
-                            pending_updates.append((time.monotonic() + delay, row.order_id, delivered_date))
+                            pending_updates.append((time.monotonic() + delay, row.order_id, None, True))
+                        elif inject_update:
+                            delay = random.uniform(cfg.update_delay_min, cfg.update_delay_max)
+                            pending_updates.append((time.monotonic() + delay, row.order_id, delivered_date, False))
                     else:
                         skipped += 1
                         logging.warning("SKIP (중복 PK): %s", row.order_id)
@@ -320,9 +346,12 @@ def run_replay(df: pd.DataFrame, ratio: float, cfg: ReplayConfig) -> None:
             # 루프 종료 후 잔여 UPDATE 발행
             if pending_updates:
                 logging.info("잔여 UPDATE %d건 발행 중...", len(pending_updates))
-                for _, oid, ddate in pending_updates:
+                for _, oid, ddate, is_cancel in pending_updates:
                     try:
-                        cursor.execute(_UPDATE_SQL, (_STATUS_DELIVERED, ddate, oid))
+                        if is_cancel:
+                            cursor.execute(_CANCEL_SQL, (oid,))
+                        else:
+                            cursor.execute(_UPDATE_SQL, (_STATUS_DELIVERED, ddate, oid))
                         updates_sent += 1
                     except Exception as e:
                         logging.warning("UPDATE 실패 %s: %s", oid, e)
