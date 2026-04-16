@@ -1,10 +1,12 @@
 # Real-time CDC Streaming Pipeline
 
 MySQL 변경 데이터를 실시간으로 캡처해 Kafka로 흘리고, Spark Structured Streaming으로 처리하는 end-to-end 데이터 파이프라인.
+CDC 이벤트를 기반으로 **운영 지표(분당 주문 건수)**와 **리스크 지표(실시간 취소율)**를 MySQL 집계 테이블로 제공.
 
 ```
-MySQL ──► Debezium ──► Kafka ──► Spark Structured Streaming ──► Parquet
-          (CDC)       (broker)   (stream processing)            (sink)
+MySQL ──► Debezium ──► Kafka ──► Spark Structured Streaming ──┬► Parquet (raw)
+          (CDC)       (broker)   (stream processing)           ├► MySQL: minute_order_summary (A1)
+                                                               └► MySQL: ten_minute_cancel_rate (B1)
 ```
 
 ---
@@ -40,18 +42,22 @@ Spark 분할 작업 (`spark-submit/split_orders_70_30.py`) 실행 후 `orders_in
 ┌─────────────────────────────────────────────────────────────┐
 │  Docker Compose                                             │
 │                                                             │
-│  MySQL 8.0 ──binlog──► Debezium ──► Kafka ──► Spark        │
+│  MySQL 8.0 ──binlog──► Debezium ──► Kafka ──► Spark         │
 │     ▲          (Kafka Connect)    (broker)   Structured     │
 │     │                                        Streaming      │
-│  Event Replayer                                   │         │
-│  (scripts/replay_orders.py)                       ▼         │
-│                                              Parquet sink   │
+│  Event Replayer                             ┌────┴────┐     │
+│  (scripts/replay_orders.py)                 ▼         ▼     │
+│                                         Parquet    MySQL    │
+│                                         (raw)    (A1, B1)   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 - **Debezium**: MySQL binlog를 읽어 INSERT/UPDATE/DELETE를 JSON 이벤트로 발행
 - **Event Replayer**: orders_future_30을 시간 압축해서 MySQL에 순차 주입 → 실시간 CDC 스트림 생성
-- **Spark**: Kafka 구독 → `payload.after` JSON string sink → Parquet 저장
+- **Spark**: Kafka 구독 → 3개 job 병렬 운영
+  - `stream_cdc.py`: `payload.after` JSON string → Parquet 저장
+  - `stream_a1_orders.py`: 10초 tumbling 윈도우 주문 건수 → MySQL `minute_order_summary`
+  - `stream_b1_cancel_rate.py`: 1분 sliding 윈도우 취소율 → MySQL `ten_minute_cancel_rate`
 
 ---
 
@@ -132,14 +138,27 @@ python scripts/replay_orders.py --duration-minutes 10 --log-level DEBUG
 ### 7. Spark Streaming 실행
 
 ```bash
-docker exec spark-master /opt/spark/bin/spark-submit \
-  --jars /workspace/jars/org.apache.spark_spark-sql-kafka-0-10_2.12-3.5.7.jar,\
+# 공통 JAR 경로
+JARS="/workspace/jars/org.apache.spark_spark-sql-kafka-0-10_2.12-3.5.7.jar,\
 /workspace/jars/org.apache.spark_spark-token-provider-kafka-0-10_2.12-3.5.7.jar,\
 /workspace/jars/org.apache.kafka_kafka-clients-3.4.1.jar,\
 /workspace/jars/org.apache.commons_commons-pool2-2.11.1.jar,\
-/workspace/jars/mysql-connector-j-8.0.33.jar \
-  /workspace/spark/stream_cdc.py
+/workspace/jars/mysql-connector-j-8.0.33.jar"
+
+# (a) Raw CDC → Parquet
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master local[*] --jars $JARS /workspace/spark/stream_cdc.py
+
+# (b) A1: 분당 주문 건수 → MySQL
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master local[*] --jars $JARS /workspace/spark/stream_a1_orders.py
+
+# (c) B1: 실시간 취소율 → MySQL
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master local[*] --jars $JARS /workspace/spark/stream_b1_cancel_rate.py
 ```
+
+> `local[*]` 모드 사용 이유: Docker 볼륨 권한 문제 회피 (driver+executor 동일 프로세스).
 
 ---
 
@@ -151,7 +170,7 @@ docker exec spark-master /opt/spark/bin/spark-submit \
 | `scripts/measure_latency.py` | CDC end-to-end latency 측정 (p50/p95/p99) |
 | `scripts/verify_restart_recovery.py` | Spark 재시작 후 checkpoint resume 검증 |
 | `scripts/verify_schema_evolution.py` | ALTER TABLE 후 Debezium schema 자동 감지 검증 |
-| `scripts/replay_orders.py` | 시간 압축 Event Replayer |
+| `scripts/replay_orders.py` | 시간 압축 Event Replayer (INSERT + UPDATE/canceled 주입) |
 | `scripts/fix_timestamps.py` | orders 테이블 NULL timestamp 일괄 수정 (초기 적재 보정용) |
 
 ```bash
@@ -201,6 +220,26 @@ docker exec kafka kafka-console-consumer \
 
 > p95/p99 이상치는 Spark micro-batch 처리 간격(30s trigger)에 기인. [ADR-010](docs/DECISIONS.md)
 
+### A1 — 주문 건수 (운영 지표)
+
+| 항목 | 값 |
+|------|-----|
+| 윈도우 | 10초 tumbling (압축 시간 기준, ADR-014) |
+| 검증 결과 | 3,000건 replay → 35+ 윈도우 upsert 확인 |
+| sink | MySQL `minute_order_summary` |
+
+### B1 — 실시간 취소율 (리스크 지표)
+
+| 항목 | 값 |
+|------|-----|
+| 윈도우 | 1분 sliding / 30초 slide (압축 시간 기준, ADR-014) |
+| 기준선 취소율 | 0.616% (n=69,674) |
+| 검증 결과 | `--include-updates` 3,000건 replay → 9개 윈도우에서 cancel_rate **0.18%~1.2%** |
+| 알람 임계치 | 1.5~2% (기준선 2~3배) |
+| sink | MySQL `ten_minute_cancel_rate` |
+
+> B1은 `order_status`의 UPDATE 전이(→canceled)를 CDC로 포착해야 성립하는 지표. INSERT-only 스트림으로 불가능 → **CDC 채택 이유가 지표 정의 자체에 내장**됨. [ADR-013](docs/DECISIONS.md)
+
 ### Data Quality
 
 ```
@@ -229,6 +268,8 @@ Layer 3 (Consist):  WARN  2 / FAIL 0  (bulk load CDC 미경유 — 설계상 exp
 | ADR-010 | End-to-end Latency 측정 설계 |
 | ADR-011 | Schema Evolution 검증 설계 |
 | ADR-012 | Data Quality 3계층 검증 설계 |
+| ADR-013 | v2 방향 전환 — CDC sink를 지표 테이블로 교체 |
+| ADR-014 | 윈도우 크기 재조정 — 압축 시간 기준 세분화 |
 
 ---
 
@@ -247,3 +288,8 @@ Layer 3 (Consist):  WARN  2 / FAIL 0  (bulk load CDC 미경유 — 설계상 exp
   - **CLI 개선**: fix_timestamps `--dry-run`, replay_orders `--include-updates`/`--log-level`/`--limit`, verify_restart_recovery `.env` 자동 로드, subprocess timeout 추가
   - **코드 정리**: 전 스크립트 `print` → `logging` 교체, 매직 넘버 상수화, `layer1_mysql` 4개 서브함수 분해, `_rename_columns` 헬퍼 분리, 미사용 파라미터 제거
 - [x] Phase 7: Data Quality 3계층 검증 + timestamp 버그 수정
+- [x] Phase 8: v2 운영·리스크 지표 파이프라인 (A1 주문 건수 + B1 취소율)
+  - **방향 전환**: Parquet raw dump → MySQL 집계 테이블로 "지표 제공" 서사 확보 (ADR-013)
+  - **A1**: 10초 tumbling 주문 건수, **B1**: 1분 sliding 취소율 (ADR-014 압축 시간 기준)
+  - **replay_orders.py 확장**: canceled UPDATE 주입 (shipped→canceled 전이) 추가
+  - **B1 검증**: `--include-updates` 3,000건 replay, 9개 윈도우에서 cancel_rate 0.18%~1.2% 확인

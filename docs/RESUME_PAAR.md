@@ -11,7 +11,7 @@
 
 - **Dataset**: Olist Brazilian E-Commerce (~35만 행, ~50MB)
 - **Stack**: MySQL 8.0, Debezium 2.7.3, Kafka (Confluent 7.6.0), Spark 3.5.7, Docker Compose
-- **차별점**: ADR 12개로 **"왜 이 결정을 했고 대안을 왜 기각했는지"** 를 모두 문서화
+- **차별점**: ADR 14개로 **"왜 이 결정을 했고 대안을 왜 기각했는지"** 를 모두 문서화
 
 ---
 
@@ -39,7 +39,7 @@ C안 채택 근거: **원본 burst 패턴 보존 + MySQL→Debezium 경로 유�
 - `scripts/replay_orders.py` 구현
   - `order_purchase_timestamp` 정렬 후 이벤트 간 시간차를 압축 비율로 나눠 `time.sleep`
   - **`INSERT IGNORE` + autocommit** → Ctrl+C 후 재실행 idempotent, 건당 binlog 이벤트 생성 (배치 commit 금지)
-  - `--include-updates` 옵션으로 `invoiced → delivered` 상태 전이 UPDATE 주입 → `op=u` 검증 경로 확보
+  - `--include-updates` 옵션으로 `invoiced → delivered` + `shipped → canceled` 상태 전이 UPDATE 주입 → `op=u` 검증 경로 확보 (B1 취소율 지표의 선행 조건)
   - `--dry-run`, `--limit`, `--duration-minutes` CLI로 CI/검증 루프 지원
 
 ## Result
@@ -276,8 +276,8 @@ Layer 3 (Consist): WARN  2 / FAIL 0   ← 설계상 expected
 ## Action
 
 - Spark Structured Streaming job 2개 신설
-  - `spark/stream_a1_orders.py` — `op='c'` 필터, 1분 tumbling, `count(order_id)`
-  - `spark/stream_b1_cancel_rate.py` — `op='c'` (분모) + `op='u' AND before.order_status != 'canceled' AND after.order_status = 'canceled'` (분자), 10분 sliding / 1분 slide
+  - `spark/stream_a1_orders.py` — `op='c'` 필터, **10초 tumbling** (ADR-014), `count(order_id)`
+  - `spark/stream_b1_cancel_rate.py` — `op='c'` (분모) + `op='u' AND before.order_status != 'canceled' AND after.order_status = 'canceled'` (분자), **1분 sliding / 30초 slide** (ADR-014)
 - MySQL sink 테이블 `minute_order_summary`, `ten_minute_cancel_rate` 신설
   - PK=`window_start`, `mysql.connector` REPLACE INTO를 `foreachBatch`에서 호출 (Spark JDBC는 upsert 미지원)
   - outputMode=`update`로 윈도우 진행 중 증가분을 대시보드에 즉시 반영
@@ -286,11 +286,14 @@ Layer 3 (Consist): WARN  2 / FAIL 0   ← 설계상 expected
 
 ## Result
 
-- A1: batch 0에서 16 윈도우 upsert, `minute_order_summary` 740 orders 확인
-- B1: batch 0에서 73 윈도우 upsert, 파이프라인 정상 (canceled UPDATE 재생은 다음 세션 `--include-updates`)
+- A1: **35+ 윈도우** upsert (10초 tumbling, 3,000건 replay), `minute_order_summary` 정상 적재
+- B1: `--include-updates` 3,000건 replay → **9개 윈도우에서 cancel_rate 0.18%~1.2%** 확인
+  - `replay_orders.py`에 canceled UPDATE 주입 추가 (shipped→canceled 전이, 100% 비율)
+  - Kafka 토픽 72,925건 (69,608 snapshot + 3,000 INSERT + 317 UPDATE)
 - op='c' 필터로 **snapshot(op='r') 69,674건 집계 미반영** 확인 → 서비스 오픈 이후 실시간 이벤트만 계산
+- ADR-014로 윈도우 크기를 압축 시간 기준으로 재조정 (A1: 1분→10초, B1: 10분→1분) — 원본 시간 기준 윈도우가 압축 환경에서 무의미해지는 문제 해결
 - 면접 동사 전환: "CDC 파이프라인을 **구축**했다" → "CDC로 **운영·리스크 지표를 실시간 제공**한다"
-- ADR-013 / DIRECTION_v2.md §3·§6·§7에 결정 근거·실측 수치 전수 기록
+- ADR-013·014 / DIRECTION_v2.md §3·§6·§7에 결정 근거·실측 수치 전수 기록
 
 ---
 
@@ -298,7 +301,7 @@ Layer 3 (Consist): WARN  2 / FAIL 0   ← 설계상 expected
 
 | # | 포인트 | 근거 |
 |---|--------|------|
-| 1 | **"왜"에 답하는 ADR 12개** | 채택/기각 이유 + 대안 비교 + trade-off 모두 기록 |
+| 1 | **"왜"에 답하는 ADR 14개** | 채택/기각 이유 + 대안 비교 + trade-off 모두 기록 |
 | 2 | **자기 비판 문서화** | "Spark도 사실 과했다"(ADR-009), "초기 계획 7개 중 3개 기각" 를 **지우지 않고 남김** |
 | 3 | **로컬에서 측정 가능한 것만 측정** | throughput 대신 latency/correctness/resiliency (ADR-004) |
 | 4 | **문제→분석→결정→검증 사이클** | 모든 Phase가 동일 구조로 정리 가능 |
@@ -317,4 +320,5 @@ Layer 3 (Consist): WARN  2 / FAIL 0   ← 설계상 expected
 > - Kafka Connect / Spark Driver 강제 종료 재기동 시나리오에서 **이벤트 유실·중복 0건** 검증 (persistent checkpoint + idempotent Parquet sink)
 > - `ALTER TABLE ADD COLUMN` 시나리오에서 Spark 재배포 없이 **zero-downtime schema evolution** 검증 (JSON string sink 설계)
 > - MySQL → Parquet → Consistency **3계층 DQ 스크립트** 직접 구현 중 `tz-aware datetime → MySQL DATETIME` 호환 이슈로 인한 **99.9% NULL 버그를 식별·수정하고 69,608건 복구**
+> - CDC 이벤트 기반 **운영 지표(10초 주문 건수) + 리스크 지표(1분 취소율)**를 MySQL 집계 테이블로 실시간 제공. B1 취소율은 `order_status` UPDATE 전이를 CDC로 포착 — **INSERT-only 스트림으로 불가능한 지표를 선정해 CDC 정당성을 내장** (ADR-013·014)
 > - 데이터 규모(~50MB) 고려하여 배치 적재는 **pandas**, 스트리밍만 Spark 로 **도구별 적합성 분리** (ADR-001)
