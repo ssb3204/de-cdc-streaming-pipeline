@@ -25,7 +25,9 @@ spark-submit/data/
 └── olist_products_dataset.csv
 ```
 
-Spark 분할 작업 (`spark-submit/split_orders_70_30.py`) 실행 후 `orders_initial_70/`, `orders_future_30/` 디렉토리가 생성됩니다.
+Spark 분할 작업 (`spark-submit/spark/split_orders_70_30.py`) 실행 후 아래 4개 디렉토리가 생성됩니다.
+
+`orders_initial_70/`, `orders_future_30/`, `order_items_initial_70/`, `order_items_future_30/`
 
 | 분할 | 비율 | 용도 |
 |------|------|------|
@@ -81,6 +83,7 @@ Spark 분할 작업 (`spark-submit/split_orders_70_30.py`) 실행 후 `orders_in
 ```bash
 cp .env.example .env
 # .env 수정: MYSQL_ROOT_PASSWORD, MYSQL_USER, MYSQL_PASSWORD, DBZ_USER, DBZ_PASSWORD
+# DB_PORT=3307 로 변경 (호스트에서 load_data.py 실행 시 docker-compose 매핑 포트)
 ```
 
 ### 2. 데이터 준비
@@ -89,7 +92,7 @@ cp .env.example .env
 # Kaggle에서 다운로드 후 spark-submit/data/에 CSV 배치
 # Spark로 70/30 분할
 docker exec spark-master /opt/spark/bin/spark-submit \
-  /workspace/spark-submit/split_orders_70_30.py
+  /workspace/spark-submit/spark/split_orders_70_30.py
 ```
 
 ### 3. 인프라 실행
